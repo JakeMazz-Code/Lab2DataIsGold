@@ -1,16 +1,24 @@
 ==================================================
 DATA VALIDATION REPORT
 ==================================================
-Generated: 2025-09-11T17:17:21.645894
+Generated: 2025-09-11T17:57:44.484887
 
 SUMMARY:
-  Total Pages Validated: 1
-  Passed: 1
-  Failed: 0
-  Pass Rate: 100.00%
-  Total Warnings: 1
+  Total Pages Validated: 10
+  Passed: 9
+  Failed: 1
+  Pass Rate: 90.00%
+  Total Warnings: 6
+
+COMMON ERRORS:
+  - Title (1 occurrences)
 
 COMMON WARNINGS:
-  - No navigation links found (1 occurrences)
+  - No content sections found (5 occurrences)
+  - Link 1 has empty text (1 occurrences)
+
+FAILED PAGES:
+  URL: https://doc.sis.columbia.edu/home.html
+    ERROR: Title: Title is empty
 
 ==================================================

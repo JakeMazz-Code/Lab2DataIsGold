@@ -1,29 +1,31 @@
 ============================================================
 DATA TRANSFORMATION REPORT
 ============================================================
-Generated: 2025-09-11T17:17:21.649894
+Generated: 2025-09-11T17:57:44.600263
 
 SUMMARY STATISTICS:
-  Total Pages Transformed: 1
+  Total Pages Transformed: 10
 
 CONTENT CATEGORIES:
-  General Documentation: 1 pages
+  General Documentation: 6 pages
+  API Documentation: 3 pages
+  Overview: 1 pages
 
 AVERAGE CONTENT METRICS:
-  Word Count: 44.0
-  Heading Count: 0.0
-  Paragraph Count: 2.0
+  Word Count: 38.1
+  Heading Count: 0.6
+  Paragraph Count: 1.7
   List Count: 0.0
   Code Block Count: 0.0
-  Link Density: 0.0
-  Content Depth: 1.0
-  Readability Score: 100.0
+  Link Density: 128.68
+  Content Depth: 0.65
+  Readability Score: 42.85
 
 CONTENT FEATURES:
-  Pages With Forms: 1
-  Pages With Tables: 1
+  Pages With Forms: 2
+  Pages With Tables: 10
   Pages With Code: 0
-  Avg Sections Per Page: 2.0
+  Avg Sections Per Page: 1.7
 
 TECHNICAL ANALYSIS:
   Pages Using Javascript: 0
@@ -40,10 +42,15 @@ TOP 10 KEYWORDS:
   - methods
   - instruction
   - please
-  - revisit
+  - update
 
 NAVIGATION INSIGHTS:
-  Root Pages: 1
+  Root Pages: 2
   Most Common Navigation Items:
+    - Fall2025
+    - Summer2025
+    - Spring2026
+    - Name
+    - Last modified
 
 ============================================================
