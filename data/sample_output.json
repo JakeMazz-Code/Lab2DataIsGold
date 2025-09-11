@@ -1,5 +1,139 @@
 {
-  "example": "processed data",
-  "timestamp": "2025-09-11T00:00:00Z",
-  "data": []
+  "metadata": {
+    "scrape_date": "2025-09-11T17:09:03.490145",
+    "total_pages": 1,
+    "source_url": "https://doc.sis.columbia.edu/",
+    "scraper_version": "1.0.0"
+  },
+  "summary_statistics": {
+    "total_pages": 1,
+    "categories": {
+      "General Documentation": 1
+    },
+    "avg_metrics": {
+      "word_count": 44.0,
+      "heading_count": 0.0,
+      "paragraph_count": 2.0,
+      "list_count": 0.0,
+      "code_block_count": 0.0,
+      "link_density": 0.0,
+      "content_depth": 1.0,
+      "readability_score": 100.0
+    },
+    "content_distribution": {
+      "pages_with_forms": 1,
+      "pages_with_tables": 1,
+      "pages_with_code": 0,
+      "avg_sections_per_page": 2.0
+    },
+    "keyword_frequency": {
+      "course": 1,
+      "information": 1,
+      "note": 1,
+      "changes": 1,
+      "frequently": 1,
+      "including": 1,
+      "methods": 1,
+      "instruction": 1,
+      "please": 1,
+      "revisit": 1
+    },
+    "technical_summary": {
+      "pages_using_javascript": 0,
+      "frameworks_detected": {},
+      "pages_with_api_endpoints": 0
+    },
+    "top_keywords": [
+      "course",
+      "information",
+      "note",
+      "changes",
+      "frequently",
+      "including",
+      "methods",
+      "instruction",
+      "please",
+      "revisit"
+    ],
+    "navigation_structure": {
+      "root_pages": [
+        "https://doc.sis.columbia.edu/"
+      ],
+      "page_relationships": {},
+      "common_navigation": {},
+      "depth_levels": {
+        "https://doc.sis.columbia.edu/": 0
+      },
+      "top_navigation": []
+    }
+  },
+  "sample_pages": [
+    {
+      "id": "4cfc83cee77d",
+      "url": "https://doc.sis.columbia.edu/",
+      "title": "CU Directory of Classes",
+      "category": "General Documentation",
+      "scraped_at": "2025-09-11T17:09:01.301758",
+      "summary": "Page: CU Directory of Classes | Contains 2 content sections",
+      "keywords": [
+        "course",
+        "information",
+        "note",
+        "changes",
+        "frequently",
+        "including",
+        "methods",
+        "instruction",
+        "please",
+        "revisit"
+      ],
+      "metrics": {
+        "word_count": 44,
+        "heading_count": 0,
+        "paragraph_count": 2,
+        "list_count": 0,
+        "code_block_count": 0,
+        "link_density": 0.0,
+        "content_depth": 1.0,
+        "readability_score": 100
+      },
+      "content": {
+        "description": "",
+        "main_heading": "",
+        "section_count": 2,
+        "sections": [
+          {
+            "type": "div",
+            "heading_hierarchy": [],
+            "content_types": [
+              "text"
+            ],
+            "text_preview": "NOTE: Course information changes frequently, including Methods of Instruction. Please revisit these pages periodically for the most recent and up-to-date course information."
+          },
+          {
+            "type": "div",
+            "heading_hierarchy": [],
+            "content_types": [
+              "text"
+            ],
+            "text_preview": "NOTE: Course information changes frequently, including Methods of Instruction. Please revisit these pages periodically for the most recent and up-to-date course information."
+          }
+        ],
+        "has_forms": true,
+        "has_tables": true,
+        "has_code_examples": false
+      },
+      "navigation": {
+        "link_count": 0,
+        "internal_links": [],
+        "external_links": []
+      },
+      "technical_indicators": {
+        "uses_javascript": false,
+        "javascript_framework": "",
+        "has_api_endpoints": false,
+        "diagram_count": 7
+      }
+    }
+  ]
 }

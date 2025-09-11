@@ -1,0 +1,49 @@
+============================================================
+DATA TRANSFORMATION REPORT
+============================================================
+Generated: 2025-09-11T17:09:03.488145
+
+SUMMARY STATISTICS:
+  Total Pages Transformed: 1
+
+CONTENT CATEGORIES:
+  General Documentation: 1 pages
+
+AVERAGE CONTENT METRICS:
+  Word Count: 44.0
+  Heading Count: 0.0
+  Paragraph Count: 2.0
+  List Count: 0.0
+  Code Block Count: 0.0
+  Link Density: 0.0
+  Content Depth: 1.0
+  Readability Score: 100.0
+
+CONTENT FEATURES:
+  Pages With Forms: 1
+  Pages With Tables: 1
+  Pages With Code: 0
+  Avg Sections Per Page: 2.0
+
+TECHNICAL ANALYSIS:
+  Pages Using Javascript: 0
+  Frameworks Detected:
+  Pages With Api Endpoints: 0
+
+TOP 10 KEYWORDS:
+  - course
+  - information
+  - note
+  - changes
+  - frequently
+  - including
+  - methods
+  - instruction
+  - please
+  - revisit
+
+NAVIGATION INSIGHTS:
+  Root Pages: 1
+  Most Common Navigation Items:
+
+============================================================

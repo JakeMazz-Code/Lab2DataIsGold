@@ -1,0 +1,16 @@
+==================================================
+DATA VALIDATION REPORT
+==================================================
+Generated: 2025-09-11T17:09:03.470372
+
+SUMMARY:
+  Total Pages Validated: 1
+  Passed: 1
+  Failed: 0
+  Pass Rate: 100.00%
+  Total Warnings: 1
+
+COMMON WARNINGS:
+  - No navigation links found (1 occurrences)
+
+==================================================
