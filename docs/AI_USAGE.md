@@ -1,0 +1,2 @@
+# AI collaboration documentation
+
