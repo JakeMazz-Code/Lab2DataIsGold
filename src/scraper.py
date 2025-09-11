@@ -160,9 +160,61 @@ class ColumbiaSISScraper:
                     # Try to detect and wait for Angular/dynamic content
                     time.sleep(3)  # Extra wait for dynamic content
                     
-                    # Check if Angular is present and try to wait for it to stabilize
+                    # Check if this is a department page and try to click on semester
+                    if '/subj/' in url and url.count('/') == 5:  # Department page
+                        logger.info("Department page detected, looking for semester links...")
+                        
+                        try:
+                            # Look for semester links (Fall 2025, Spring 2025, etc.)
+                            semester_links = self.driver.find_elements(By.CSS_SELECTOR, "a")
+                            clicked_semester = False
+                            
+                            for link in semester_links:
+                                link_text = link.text.strip()
+                                # Check for semester patterns
+                                if any(term in link_text for term in ['Fall 202', 'Spring 202', 'Summer 202']):
+                                    logger.info(f"Found semester link: {link_text}")
+                                    try:
+                                        # Scroll to the element
+                                        self.driver.execute_script("arguments[0].scrollIntoView(true);", link)
+                                        time.sleep(1)
+                                        
+                                        # Click the semester link
+                                        link.click()
+                                        logger.info(f"Clicked on semester: {link_text}")
+                                        clicked_semester = True
+                                        
+                                        # Wait for content to load after click
+                                        time.sleep(3)
+                                        
+                                        # Check if new content loaded
+                                        WebDriverWait(self.driver, 5).until(
+                                            lambda driver: len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/subj/']")) > 0
+                                        )
+                                        
+                                        break  # Stop after clicking first semester
+                                    except Exception as e:
+                                        logger.warning(f"Could not click semester link: {e}")
+                                        # Try JavaScript click as fallback
+                                        try:
+                                            self.driver.execute_script("arguments[0].click();", link)
+                                            logger.info(f"Clicked via JavaScript on semester: {link_text}")
+                                            clicked_semester = True
+                                            time.sleep(3)
+                                            break
+                                        except:
+                                            continue
+                            
+                            if clicked_semester:
+                                logger.info("Successfully expanded semester content")
+                            else:
+                                logger.info("No semester links found or clickable")
+                                
+                        except Exception as e:
+                            logger.warning(f"Error handling semester links: {e}")
+                    
+                    # Check if Angular is present
                     try:
-                        # Execute JavaScript to check for Angular
                         is_angular = self.driver.execute_script("""
                             return typeof angular !== 'undefined' || 
                                    document.querySelector('[ng-app]') !== null ||
@@ -171,35 +223,21 @@ class ColumbiaSISScraper:
                         
                         if is_angular:
                             logger.info("Angular application detected, waiting for content...")
-                            time.sleep(3)  # Give Angular more time
-                            
-                            # Try clicking on any expandable elements
-                            try:
-                                # Look for and click on letter links (A, B, C, etc.)
-                                letter_links = self.driver.find_elements(By.CSS_SELECTOR, "a")
-                                for link in letter_links[:26]:  # Check first 26 links for letters
-                                    if len(link.text.strip()) == 1 and link.text.strip().isalpha():
-                                        logger.info(f"Found letter link: {link.text}")
-                                        # Don't click, just note it exists
-                                        break
-                            except:
-                                pass
+                            time.sleep(2)
                     except:
                         pass
                     
-                    # Get page source after all waits
+                    # Get page source after all waits and clicks
                     page_source = self.driver.page_source
                     
                     # Log some debugging info
                     links_count = len(self.driver.find_elements(By.TAG_NAME, "a"))
                     logger.info(f"Page loaded with {links_count} total <a> tags")
                     
-                    # Try to log visible text to debug
-                    try:
-                        visible_text = self.driver.find_element(By.TAG_NAME, "body").text[:500]
-                        logger.debug(f"Page visible text preview: {visible_text}")
-                    except:
-                        pass
+                    # Look specifically for course links
+                    course_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='-202']")
+                    if course_links:
+                        logger.info(f"Found {len(course_links)} course links with semester codes")
                     
                     logger.info(f"Successfully fetched: {url}")
                     return page_source
@@ -215,7 +253,7 @@ class ColumbiaSISScraper:
                     return None
         
         return None
-def extract_javascript_data(self) -> Dict:
+    def extract_javascript_data(self) -> Dict:
         """Extract any data loaded by JavaScript"""
         js_data = {}
         
@@ -288,7 +326,7 @@ def extract_javascript_data(self) -> Dict:
         if meta_desc:
             page_data['description'] = meta_desc.get('content', '')
         
-        # Look for main content areas - adapted for course directory structure
+        # Look for main content areas
         content_selectors = [
             'main', 
             '[role="main"]',
@@ -297,7 +335,7 @@ def extract_javascript_data(self) -> Dict:
             '.doc-content',
             '#content',
             'article',
-            'body'  # Fallback to body
+            'body'
         ]
         
         main_content = None
@@ -306,13 +344,11 @@ def extract_javascript_data(self) -> Dict:
             if main_content:
                 break
         
-        # If no main content found, use body
         if not main_content:
             main_content = soup.find('body')
         
         if main_content:
             # Extract content sections
-            # For course pages, look for course info
             course_info = main_content.find_all(['div', 'p', 'section'], recursive=True)
             
             for i, elem in enumerate(course_info[:20]):
@@ -347,7 +383,7 @@ def extract_javascript_data(self) -> Dict:
         all_links = soup.find_all('a', href=True)
         seen_hrefs = set()
         
-        # Also try to get links directly from Selenium (in case BeautifulSoup misses dynamic ones)
+        # Also try to get links directly from Selenium
         try:
             selenium_links = self.driver.find_elements(By.TAG_NAME, "a")
             logger.info(f"Found {len(selenium_links)} links via Selenium")
@@ -366,7 +402,10 @@ def extract_javascript_data(self) -> Dict:
                         elif href and not href.startswith('http'):
                             is_internal = True
                         
-                        # Check for letter navigation (A-Z)
+                        # Check for different types of links
+                        priority = 'normal'
+                        
+                        # Letter navigation (A-Z)
                         if text and len(text.strip()) == 1 and text.strip().isalpha():
                             page_data['navigation_links'].append({
                                 'text': f"Letter: {text.strip()}",
@@ -374,8 +413,25 @@ def extract_javascript_data(self) -> Dict:
                                 'is_internal': is_internal,
                                 'priority': 'high'
                             })
-                            logger.info(f"Found letter navigation: {text.strip()} -> {href}")
-                        elif href:
+                            logger.info(f"Found letter navigation: {text.strip()}")
+                        # Semester links
+                        elif text and any(term in text for term in ['Fall 202', 'Spring 202', 'Summer 202']):
+                            page_data['navigation_links'].append({
+                                'text': f"Semester: {text}",
+                                'href': href,
+                                'is_internal': is_internal,
+                                'priority': 'semester'
+                            })
+                            logger.info(f"Found semester link: {text}")
+                        # Course links (contain dash and year)
+                        elif href and '-202' in href:
+                            page_data['navigation_links'].append({
+                                'text': text if text else href.split('/')[-1],
+                                'href': href,
+                                'is_internal': is_internal,
+                                'priority': 'course'
+                            })
+                        else:
                             page_data['navigation_links'].append({
                                 'text': text if text else href.split('/')[-1],
                                 'href': href,
@@ -392,14 +448,11 @@ def extract_javascript_data(self) -> Dict:
             href = link['href']
             link_text = link.text.strip()
             
-            # Skip if already seen via Selenium
             if href in seen_hrefs:
                 continue
             seen_hrefs.add(href)
             
-            # Process the href
             if href and href != '#':
-                # Check if it's internal
                 is_internal = False
                 if href.startswith('/'):
                     is_internal = True
@@ -408,7 +461,6 @@ def extract_javascript_data(self) -> Dict:
                 elif not href.startswith('http'):
                     is_internal = True
                 
-                # Add to navigation links
                 page_data['navigation_links'].append({
                     'text': link_text if link_text else href,
                     'href': href,
@@ -416,10 +468,9 @@ def extract_javascript_data(self) -> Dict:
                     'priority': 'normal'
                 })
         
-        # Also look for any department/course patterns in the URL structure
+        # Determine page type
         if '/subj/' in url and '-' in url:
             page_data['metadata']['page_type'] = 'course'
-            # Extract course info from URL
             parts = url.split('/')
             for part in parts:
                 if '-' in part:
@@ -430,14 +481,13 @@ def extract_javascript_data(self) -> Dict:
                         page_data['metadata']['section'] = course_parts[2]
         elif '/subj/' in url:
             page_data['metadata']['page_type'] = 'department'
-            # Extract department from URL
             parts = url.rstrip('/').split('/')
             if parts:
                 page_data['metadata']['department'] = parts[-1]
         else:
             page_data['metadata']['page_type'] = 'main'
         
-        # Extract forms (for search functionality)
+        # Extract forms
         forms = soup.find_all('form')
         for form in forms[:5]:
             form_data = {
@@ -456,7 +506,7 @@ def extract_javascript_data(self) -> Dict:
             if form_data['inputs']:
                 page_data['forms'].append(form_data)
         
-        # Extract tables (common in course listings)
+        # Extract tables
         tables = soup.find_all('table')
         if tables:
             page_data['metadata']['table_count'] = len(tables)
@@ -464,7 +514,7 @@ def extract_javascript_data(self) -> Dict:
         
         return page_data
 
-def scrape_site(self, max_pages: int = 10) -> List[Dict]:
+    def scrape_site(self, max_pages: int = 10) -> List[Dict]:
         """Main scraping method with page limit for respectful scraping"""
         logger.info(f"Starting Selenium scrape of {self.base_url}")
         
