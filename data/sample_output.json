@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "scrape_date": "2025-09-11T17:09:03.490145",
+    "scrape_date": "2025-09-11T17:17:21.650894",
     "total_pages": 1,
     "source_url": "https://doc.sis.columbia.edu/",
     "scraper_version": "1.0.0"
@@ -73,7 +73,7 @@
       "url": "https://doc.sis.columbia.edu/",
       "title": "CU Directory of Classes",
       "category": "General Documentation",
-      "scraped_at": "2025-09-11T17:09:01.301758",
+      "scraped_at": "2025-09-11T17:17:19.457116",
       "summary": "Page: CU Directory of Classes | Contains 2 content sections",
       "keywords": [
         "course",

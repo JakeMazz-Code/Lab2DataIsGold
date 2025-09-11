@@ -1,4 +1,3 @@
-# Main scraping logic
 """
 Columbia SIS Documentation Scraper with Selenium
 Main scraping logic with respectful scraping practices and full pipeline
@@ -292,18 +291,17 @@ class ColumbiaSISScraper:
                        section_data['lists'], section_data['code_blocks']]):
                     page_data['content_sections'].append(section_data)
         
-        # Extract navigation links
+        # Extract navigation links - broader search
+        # Try multiple strategies to find links
         nav_areas = soup.find_all(['nav', '[role="navigation"]', '.navigation', '.sidebar'])
+        
+        # If no navigation areas found, search entire page for links
+        if not nav_areas:
+            nav_areas = [soup]  # Search entire page
+            
         for nav in nav_areas:
-            for link in nav.find_all('a', href=True)[:30]:
-                href = link['href']
-                link_text = link.text.strip()
-                if link_text:  # Only add links with text
-                    page_data['navigation_links'].append({
-                        'text': link_text,
-                        'href': href,
-                        'is_internal': href.startswith('/') or self.base_url in href
-                    })
+            for link in nav.find_all('a', href=True)[:50]:  # Increased limit
+                href = link['href
         
         # Extract forms (common in documentation for search or examples)
         forms = soup.find_all('form')
