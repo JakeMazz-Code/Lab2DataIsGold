@@ -83,18 +83,53 @@ class ColumbiaSISScraper:
         return delay + jitter
     
     def wait_for_page_load(self, timeout: int = 10) -> bool:
-        """Wait for page to load completely"""
+        """Wait for page to load completely, including Angular/dynamic content"""
         try:
             # Wait for body element to be present
             WebDriverWait(self.driver, timeout).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
-            # Additional wait for any dynamic content
-            time.sleep(1)
+            # Wait for Angular to load (if present)
+            time.sleep(2)  # Give Angular time to bootstrap
+            
+            # Try to wait for specific Angular elements or data attributes
+            try:
+                # Wait for any ng-app, ng-controller, or data-ng attributes (Angular indicators)
+                WebDriverWait(self.driver, 5).until(
+                    lambda driver: driver.execute_script("""
+                        return document.querySelector('[ng-app], [data-ng-app], [ng-controller], [data-ng-controller]') !== null ||
+                               document.querySelector('[ng-repeat], [data-ng-repeat]') !== null ||
+                               document.querySelector('.ng-scope') !== null ||
+                               document.querySelector('a[href*="subj/"]') !== null;
+                    """)
+                )
+                logger.info("Angular/dynamic content detected and loaded")
+            except:
+                logger.info("No Angular markers found or timeout waiting for dynamic content")
+            
+            # Additional wait for any AJAX/dynamic content
+            time.sleep(2)
+            
+            # Try to wait for links to appear
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "a[href]"))
+                )
+            except:
+                pass
             
             # Check if page has loaded by executing JavaScript
             page_state = self.driver.execute_script("return document.readyState")
+            
+            # Scroll to trigger any lazy loading
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
+            time.sleep(1)
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight*2/3);")
+            time.sleep(1)
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+            
             return page_state == "complete"
             
         except TimeoutException:
@@ -120,16 +155,52 @@ class ColumbiaSISScraper:
                 # Navigate to URL
                 self.driver.get(url)
                 
-                # Wait for page to load
+                # Wait for page to load (including Angular content)
                 if self.wait_for_page_load():
-                    # Scroll to load any lazy-loaded content
-                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                    time.sleep(0.5)
-                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(0.5)
+                    # Try to detect and wait for Angular/dynamic content
+                    time.sleep(3)  # Extra wait for dynamic content
                     
-                    # Get page source
+                    # Check if Angular is present and try to wait for it to stabilize
+                    try:
+                        # Execute JavaScript to check for Angular
+                        is_angular = self.driver.execute_script("""
+                            return typeof angular !== 'undefined' || 
+                                   document.querySelector('[ng-app]') !== null ||
+                                   document.querySelector('[data-ng-app]') !== null;
+                        """)
+                        
+                        if is_angular:
+                            logger.info("Angular application detected, waiting for content...")
+                            time.sleep(3)  # Give Angular more time
+                            
+                            # Try clicking on any expandable elements
+                            try:
+                                # Look for and click on letter links (A, B, C, etc.)
+                                letter_links = self.driver.find_elements(By.CSS_SELECTOR, "a")
+                                for link in letter_links[:26]:  # Check first 26 links for letters
+                                    if len(link.text.strip()) == 1 and link.text.strip().isalpha():
+                                        logger.info(f"Found letter link: {link.text}")
+                                        # Don't click, just note it exists
+                                        break
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    # Get page source after all waits
                     page_source = self.driver.page_source
+                    
+                    # Log some debugging info
+                    links_count = len(self.driver.find_elements(By.TAG_NAME, "a"))
+                    logger.info(f"Page loaded with {links_count} total <a> tags")
+                    
+                    # Try to log visible text to debug
+                    try:
+                        visible_text = self.driver.find_element(By.TAG_NAME, "body").text[:500]
+                        logger.debug(f"Page visible text preview: {visible_text}")
+                    except:
+                        pass
+                    
                     logger.info(f"Successfully fetched: {url}")
                     return page_source
                 else:
@@ -144,8 +215,7 @@ class ColumbiaSISScraper:
                     return None
         
         return None
-    
-    def extract_javascript_data(self) -> Dict:
+def extract_javascript_data(self) -> Dict:
         """Extract any data loaded by JavaScript"""
         js_data = {}
         
@@ -218,7 +288,7 @@ class ColumbiaSISScraper:
         if meta_desc:
             page_data['description'] = meta_desc.get('content', '')
         
-        # Look for main content areas (common in documentation sites)
+        # Look for main content areas - adapted for course directory structure
         content_selectors = [
             'main', 
             '[role="main"]',
@@ -226,7 +296,8 @@ class ColumbiaSISScraper:
             '.documentation',
             '.doc-content',
             '#content',
-            'article'
+            'article',
+            'body'  # Fallback to body
         ]
         
         main_content = None
@@ -241,71 +312,134 @@ class ColumbiaSISScraper:
         
         if main_content:
             # Extract content sections
-            sections = main_content.find_all(['section', 'div'], recursive=True)
+            # For course pages, look for course info
+            course_info = main_content.find_all(['div', 'p', 'section'], recursive=True)
             
-            for section in sections[:20]:  # Limit sections
-                section_data = {
-                    'type': section.name,
-                    'id': section.get('id', ''),
-                    'class': ' '.join(section.get('class', [])),
-                    'headings': [],
-                    'paragraphs': [],
-                    'lists': [],
-                    'code_blocks': []
-                }
-                
-                # Extract headings
-                for heading in section.find_all(['h2', 'h3', 'h4', 'h5']):
-                    section_data['headings'].append({
-                        'level': heading.name,
-                        'text': heading.text.strip(),
-                        'id': heading.get('id', '')
-                    })
-                
-                # Extract paragraphs
-                for para in section.find_all('p'):
-                    text = para.text.strip()
-                    if text and len(text) > 20:  # Skip very short paragraphs
+            for i, elem in enumerate(course_info[:20]):
+                if elem.text.strip():
+                    section_data = {
+                        'type': elem.name,
+                        'id': elem.get('id', ''),
+                        'class': ' '.join(elem.get('class', [])),
+                        'headings': [],
+                        'paragraphs': [],
+                        'lists': [],
+                        'code_blocks': []
+                    }
+                    
+                    # Add text content
+                    text = elem.text.strip()
+                    if text and len(text) > 20:
                         section_data['paragraphs'].append(text[:500])
-                
-                # Extract lists
-                for list_elem in section.find_all(['ul', 'ol']):
-                    list_items = [li.text.strip() for li in list_elem.find_all('li', recursive=False)]
-                    if list_items:
-                        section_data['lists'].append({
-                            'type': list_elem.name,
-                            'items': list_items[:10]
+                    
+                    # Look for any headings within
+                    for heading in elem.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                        section_data['headings'].append({
+                            'level': heading.name,
+                            'text': heading.text.strip(),
+                            'id': heading.get('id', '')
                         })
-                
-                # Extract code blocks
-                for code in section.find_all(['code', 'pre']):
-                    code_text = code.text.strip()
-                    if code_text:
-                        section_data['code_blocks'].append({
-                            'language': code.get('class', [''])[0] if code.get('class') else 'unknown',
-                            'content': code_text[:300]  # Limit code length
-                        })
-                
-                # Only add section if it has content
-                if any([section_data['headings'], section_data['paragraphs'], 
-                       section_data['lists'], section_data['code_blocks']]):
-                    page_data['content_sections'].append(section_data)
+                    
+                    if section_data['paragraphs'] or section_data['headings']:
+                        page_data['content_sections'].append(section_data)
         
-        # Extract navigation links - broader search
-        # Try multiple strategies to find links
-        nav_areas = soup.find_all(['nav', '[role="navigation"]', '.navigation', '.sidebar'])
+        # Extract ALL links - including dynamically loaded ones
+        all_links = soup.find_all('a', href=True)
+        seen_hrefs = set()
         
-        # If no navigation areas found, search entire page for links
-        if not nav_areas:
-            nav_areas = [soup]  # Search entire page
+        # Also try to get links directly from Selenium (in case BeautifulSoup misses dynamic ones)
+        try:
+            selenium_links = self.driver.find_elements(By.TAG_NAME, "a")
+            logger.info(f"Found {len(selenium_links)} links via Selenium")
             
-        for nav in nav_areas:
-            for link in nav.find_all('a', href=True)[:50]:  # Increased limit
-                href = link['href
+            for link_elem in selenium_links:
+                try:
+                    href = link_elem.get_attribute('href')
+                    text = link_elem.text
+                    if href and href not in seen_hrefs:
+                        seen_hrefs.add(href)
+                        
+                        # Determine if internal
+                        is_internal = False
+                        if href and 'doc.sis.columbia.edu' in href:
+                            is_internal = True
+                        elif href and not href.startswith('http'):
+                            is_internal = True
+                        
+                        # Check for letter navigation (A-Z)
+                        if text and len(text.strip()) == 1 and text.strip().isalpha():
+                            page_data['navigation_links'].append({
+                                'text': f"Letter: {text.strip()}",
+                                'href': href,
+                                'is_internal': is_internal,
+                                'priority': 'high'
+                            })
+                            logger.info(f"Found letter navigation: {text.strip()} -> {href}")
+                        elif href:
+                            page_data['navigation_links'].append({
+                                'text': text if text else href.split('/')[-1],
+                                'href': href,
+                                'is_internal': is_internal,
+                                'priority': 'normal'
+                            })
+                except:
+                    continue
+        except Exception as e:
+            logger.warning(f"Could not extract Selenium links: {e}")
         
-        # Extract forms (common in documentation for search or examples)
+        # Also parse BeautifulSoup links as backup
+        for link in all_links:
+            href = link['href']
+            link_text = link.text.strip()
+            
+            # Skip if already seen via Selenium
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            
+            # Process the href
+            if href and href != '#':
+                # Check if it's internal
+                is_internal = False
+                if href.startswith('/'):
+                    is_internal = True
+                elif 'doc.sis.columbia.edu' in href:
+                    is_internal = True
+                elif not href.startswith('http'):
+                    is_internal = True
+                
+                # Add to navigation links
+                page_data['navigation_links'].append({
+                    'text': link_text if link_text else href,
+                    'href': href,
+                    'is_internal': is_internal,
+                    'priority': 'normal'
+                })
+        
+        # Also look for any department/course patterns in the URL structure
+        if '/subj/' in url and '-' in url:
+            page_data['metadata']['page_type'] = 'course'
+            # Extract course info from URL
+            parts = url.split('/')
+            for part in parts:
+                if '-' in part:
+                    course_parts = part.split('-')
+                    if len(course_parts) >= 3:
+                        page_data['metadata']['course_code'] = course_parts[0]
+                        page_data['metadata']['term'] = course_parts[1]
+                        page_data['metadata']['section'] = course_parts[2]
+        elif '/subj/' in url:
+            page_data['metadata']['page_type'] = 'department'
+            # Extract department from URL
+            parts = url.rstrip('/').split('/')
+            if parts:
+                page_data['metadata']['department'] = parts[-1]
+        else:
+            page_data['metadata']['page_type'] = 'main'
+        
+        # Extract forms (for search functionality)
         forms = soup.find_all('form')
-        for form in forms[:5]:  # Limit forms
+        for form in forms[:5]:
             form_data = {
                 'action': form.get('action', ''),
                 'method': form.get('method', 'get'),
@@ -322,23 +456,15 @@ class ColumbiaSISScraper:
             if form_data['inputs']:
                 page_data['forms'].append(form_data)
         
-        # Extract tables
+        # Extract tables (common in course listings)
         tables = soup.find_all('table')
         if tables:
             page_data['metadata']['table_count'] = len(tables)
             page_data['metadata']['has_data_tables'] = True
         
-        # Extract images with alt text (for documentation diagrams)
-        images = soup.find_all('img', alt=True)
-        if images:
-            page_data['metadata']['diagram_count'] = len(images)
-            page_data['metadata']['diagram_descriptions'] = [
-                img.get('alt', '')[:100] for img in images[:5]
-            ]
-        
         return page_data
-    
-    def scrape_site(self, max_pages: int = 10) -> List[Dict]:
+
+def scrape_site(self, max_pages: int = 10) -> List[Dict]:
         """Main scraping method with page limit for respectful scraping"""
         logger.info(f"Starting Selenium scrape of {self.base_url}")
         
@@ -346,8 +472,29 @@ class ColumbiaSISScraper:
         self.setup_driver()
         
         try:
-            # Start with base URL
+            # Define common department codes at Columbia
+            sample_departments = [
+                'COMS',  # Computer Science
+                'MATH',  # Mathematics
+                'STAT',  # Statistics
+                'PHYS',  # Physics
+                'CHEM',  # Chemistry
+                'BIOL',  # Biology
+                'ECON',  # Economics
+                'ENGL',  # English
+                'HIST',  # History
+                'PSYC',  # Psychology
+            ]
+            
+            # Start with base URL and force-add some department pages
             urls_to_visit = [self.base_url]
+            
+            # Directly add department URLs since we know the structure
+            for dept in sample_departments[:min(5, max_pages-1)]:  # Add departments based on max_pages
+                dept_url = f"{self.base_url}subj/{dept}/"
+                urls_to_visit.append(dept_url)
+                logger.info(f"Pre-added department URL: {dept_url}")
+            
             pages_scraped = 0
             
             while urls_to_visit and pages_scraped < max_pages:
@@ -366,22 +513,101 @@ class ColumbiaSISScraper:
                     self.scraped_data.append(page_data)
                     pages_scraped += 1
                     
-                    # Extract new URLs to visit (limited crawling)
-                    for link in page_data['navigation_links'][:5]:
-                        if link['is_internal'] and link['href'] not in self.visited_urls:
-                            if link['href'].startswith('/'):
-                                full_url = self.base_url.rstrip('/') + link['href']
-                            elif link['href'].startswith('http'):
-                                full_url = link['href']
-                            else:
-                                full_url = self.base_url.rstrip('/') + '/' + link['href']
+                    # Log page type
+                    page_type = page_data.get('metadata', {}).get('page_type', 'unknown')
+                    logger.info(f"Processing {page_type} page: {current_url}")
+                    logger.info(f"Found {len(page_data['navigation_links'])} total links")
+                    
+                    # Extract new URLs to visit
+                    links_added = 0
+                    high_priority_links = []
+                    normal_links = []
+                    
+                    for link in page_data['navigation_links']:
+                        if link['is_internal']:
+                            # Build full URL
+                            href = link['href']  # THIS LINE WAS MISSING THE CLOSING BRACKET
                             
-                            if full_url not in self.visited_urls and len(urls_to_visit) < 20:
-                                urls_to_visit.append(full_url)
+                            # Handle different URL formats
+                            if href.startswith('http'):
+                                full_url = href
+                            elif href.startswith('/'):
+                                full_url = self.base_url.rstrip('/') + href
+                            elif href.startswith('subj/'):
+                                full_url = self.base_url + href
+                            elif href.startswith('./'):
+                                # Relative to current directory
+                                base_path = '/'.join(current_url.split('/')[:-1])
+                                full_url = base_path + '/' + href[2:]
+                            elif href.startswith('../'):
+                                # Up one directory
+                                base_path = '/'.join(current_url.split('/')[:-2])
+                                full_url = base_path + '/' + href[3:]
+                            else:
+                                # Assume relative to base
+                                full_url = self.base_url + href
+                            
+                            # Clean up URL
+                            full_url = full_url.replace('//', '/').replace('https:/', 'https://')
+                            
+                            # Check if it's a Columbia SIS URL and not already queued
+                            if 'doc.sis.columbia.edu' in full_url and full_url not in self.visited_urls and full_url not in urls_to_visit:
+                                # Check link priority
+                                if link.get('priority') == 'high':
+                                    # Alphabet navigation links - highest priority
+                                    high_priority_links.append(full_url)
+                                elif '/subj/' in full_url and '-' in full_url:
+                                    # Individual course page - medium priority
+                                    if links_added < 3:  # Limit courses per page
+                                        normal_links.insert(0, full_url)
+                                        links_added += 1
+                                elif '/subj/' in full_url:
+                                    # Department page - medium priority
+                                    normal_links.append(full_url)
+                                else:
+                                    # Other pages - low priority
+                                    if len(normal_links) < 10:
+                                        normal_links.append(full_url)
+                    
+                    # Add high priority links first
+                    for url in high_priority_links[:3]:
+                        if len(urls_to_visit) < 20:
+                            urls_to_visit.insert(0, url)
+                            logger.info(f"Added high priority link: {url}")
+                    
+                    # Then add normal priority links
+                    for url in normal_links[:5]:
+                        if len(urls_to_visit) < 20:
+                            urls_to_visit.append(url)
                     
                     logger.info(f"Scraped {pages_scraped}/{max_pages} pages. Queue size: {len(urls_to_visit)}")
+                    
+                    # If we're on a department page and found no course links, try constructing some
+                    if page_type == 'department' and links_added == 0:
+                        dept_code = page_data.get('metadata', {}).get('department', '')
+                        if dept_code:
+                            # Try common course patterns
+                            sample_courses = [
+                                f"{self.base_url}subj/{dept_code}/W1001-20243-001/",
+                                f"{self.base_url}subj/{dept_code}/W3134-20243-001/",
+                                f"{self.base_url}subj/{dept_code}/W4111-20243-001/"
+                            ]
+                            for course_url in sample_courses[:2]:
+                                if course_url not in self.visited_urls and len(urls_to_visit) < 20:
+                                    urls_to_visit.append(course_url)
+                                    logger.info(f"Added constructed course URL: {course_url}")
             
             logger.info(f"Scraping complete. Total pages scraped: {len(self.scraped_data)}")
+            
+            # Log summary of what was scraped
+            page_types = {}
+            for page in self.scraped_data:
+                pt = page.get('metadata', {}).get('page_type', 'unknown')
+                page_types[pt] = page_types.get(pt, 0) + 1
+            logger.info(f"Page types scraped: {page_types}")
+            
+        except Exception as e:
+            logger.error(f"Error during scraping: {e}")
             
         finally:
             # Always close the driver
