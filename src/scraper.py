@@ -414,13 +414,13 @@ class ColumbiaSISScraper:
                                 'priority': 'high'
                             })
                             logger.info(f"Found letter navigation: {text.strip()}")
-                        # Semester links
-                        elif text and any(term in text for term in ['Fall 202', 'Spring 202', 'Summer 202']):
+                        # Semester links - HIGHEST PRIORITY
+                        elif text and any(term in text for term in ['Fall 202', 'Spring 202', 'Summer 202', 'Fall202', 'Spring202', 'Summer202']):
                             page_data['navigation_links'].append({
                                 'text': f"Semester: {text}",
                                 'href': href,
                                 'is_internal': is_internal,
-                                'priority': 'semester'
+                                'priority': 'semester'  # Changed to highest priority
                             })
                             logger.info(f"Found semester link: {text}")
                         # Course links (contain dash and year)
@@ -537,10 +537,16 @@ class ColumbiaSISScraper:
             ]
             
             # Start with base URL and force-add some department pages
-            urls_to_visit = [self.base_url]
+            # Start with strategic pages
+            urls_to_visit = [
+                self.base_url,
+                # Add subject listing pages that have semester links
+                f"{self.base_url}sel/subj-C.html",  # C subjects (includes COMS)
+                f"{self.base_url}sel/subj-E.html",  # E subjects (Engineering)
+            ]
             
             # Directly add department URLs since we know the structure
-            for dept in sample_departments[:min(5, max_pages-1)]:  # Add departments based on max_pages
+            for dept in sample_departments[:min(3, max_pages-1)]:  # Add fewer departments to leave room for semester pages
                 dept_url = f"{self.base_url}subj/{dept}/"
                 urls_to_visit.append(dept_url)
                 logger.info(f"Pre-added department URL: {dept_url}")
@@ -570,13 +576,15 @@ class ColumbiaSISScraper:
                     
                     # Extract new URLs to visit
                     links_added = 0
+                    semester_links = []  # HIGHEST PRIORITY
                     high_priority_links = []
+                    course_links = []  # For actual course pages
                     normal_links = []
                     
                     for link in page_data['navigation_links']:
                         if link['is_internal']:
                             # Build full URL
-                            href = link['href']  # THIS LINE WAS MISSING THE CLOSING BRACKET
+                            href = link['href']
                             
                             # Handle different URL formats
                             if href.startswith('http'):
@@ -603,14 +611,21 @@ class ColumbiaSISScraper:
                             # Check if it's a Columbia SIS URL and not already queued
                             if 'doc.sis.columbia.edu' in full_url and full_url not in self.visited_urls and full_url not in urls_to_visit:
                                 # Check link priority
-                                if link.get('priority') == 'high':
-                                    # Alphabet navigation links - highest priority
+                                if link.get('priority') == 'semester':
+                                    # SEMESTER LINKS - ABSOLUTE HIGHEST PRIORITY
+                                    semester_links.append(full_url)
+                                    logger.info(f"Found semester link to prioritize: {full_url}")
+                                elif '_Fall202' in full_url or '_Spring202' in full_url or '_Summer202' in full_url:
+                                    # Also catch semester URLs by pattern
+                                    semester_links.append(full_url)
+                                    logger.info(f"Found semester URL pattern: {full_url}")
+                                elif link.get('priority') == 'high':
+                                    # Alphabet navigation links - high priority
                                     high_priority_links.append(full_url)
-                                elif '/subj/' in full_url and '-' in full_url:
-                                    # Individual course page - medium priority
-                                    if links_added < 3:  # Limit courses per page
-                                        normal_links.insert(0, full_url)
-                                        links_added += 1
+                                elif '/subj/' in full_url and full_url.count('-') >= 2:
+                                    # Individual course page (e.g., COMS-W4156-001)
+                                    course_links.append(full_url)
+                                    links_added += 1
                                 elif '/subj/' in full_url:
                                     # Department page - medium priority
                                     normal_links.append(full_url)
@@ -619,15 +634,27 @@ class ColumbiaSISScraper:
                                     if len(normal_links) < 10:
                                         normal_links.append(full_url)
                     
-                    # Add high priority links first
+                    # Add semester links FIRST (absolute highest priority)
+                    for url in semester_links[:10]:  # Take more semester links
+                        if len(urls_to_visit) < 50:  # Increase queue size
+                            urls_to_visit.insert(0, url)  # Add at the beginning
+                            logger.info(f"Added SEMESTER link (TOP PRIORITY): {url}")
+                    
+                    # Add course links second (actual course pages)
+                    for url in course_links[:5]:
+                        if len(urls_to_visit) < 50:
+                            urls_to_visit.insert(len(semester_links), url)  # After semester links
+                            logger.info(f"Added course link: {url}")
+                    
+                    # Add high priority links (alphabet navigation)
                     for url in high_priority_links[:3]:
-                        if len(urls_to_visit) < 20:
-                            urls_to_visit.insert(0, url)
+                        if len(urls_to_visit) < 50:
+                            urls_to_visit.append(url)
                             logger.info(f"Added high priority link: {url}")
                     
                     # Then add normal priority links
                     for url in normal_links[:5]:
-                        if len(urls_to_visit) < 20:
+                        if len(urls_to_visit) < 50:
                             urls_to_visit.append(url)
                     
                     logger.info(f"Scraped {pages_scraped}/{max_pages} pages. Queue size: {len(urls_to_visit)}")
