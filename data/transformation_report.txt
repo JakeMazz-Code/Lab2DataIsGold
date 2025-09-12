@@ -1,31 +1,30 @@
 ============================================================
 DATA TRANSFORMATION REPORT
 ============================================================
-Generated: 2025-09-11T17:57:44.600263
+Generated: 2025-09-12T15:47:51.748763
 
 SUMMARY STATISTICS:
-  Total Pages Transformed: 10
+  Total Pages Transformed: 50
 
 CONTENT CATEGORIES:
-  General Documentation: 6 pages
-  API Documentation: 3 pages
-  Overview: 1 pages
+  API Documentation: 35 pages
+  General Documentation: 15 pages
 
 AVERAGE CONTENT METRICS:
-  Word Count: 38.1
-  Heading Count: 0.6
-  Paragraph Count: 1.7
+  Word Count: 120.42
+  Heading Count: 3.62
+  Paragraph Count: 5.56
   List Count: 0.0
   Code Block Count: 0.0
-  Link Density: 128.68
-  Content Depth: 0.65
-  Readability Score: 42.85
+  Link Density: 18.12
+  Content Depth: 1.59
+  Readability Score: 54.26
 
 CONTENT FEATURES:
-  Pages With Forms: 2
-  Pages With Tables: 10
+  Pages With Forms: 1
+  Pages With Tables: 50
   Pages With Code: 0
-  Avg Sections Per Page: 1.7
+  Avg Sections Per Page: 5.56
 
 TECHNICAL ANALYSIS:
   Pages Using Javascript: 0
@@ -33,24 +32,24 @@ TECHNICAL ANALYSIS:
   Pages With Api Endpoints: 0
 
 TOP 10 KEYWORDS:
+  - update
   - course
   - information
   - note
+  - chemistry
+  - chemical
+  - engineering
+  - instructor
+  - subject
   - changes
-  - frequently
-  - including
-  - methods
-  - instruction
-  - please
-  - update
 
 NAVIGATION INSIGHTS:
-  Root Pages: 2
+  Root Pages: 1
   Most Common Navigation Items:
-    - Fall2025
-    - Summer2025
-    - Spring2026
-    - Name
-    - Last modified
+    - View in Vergil
+    - Section 001
+    - Section 002
+    - Section 003
+    - Section 004
 
 ============================================================
