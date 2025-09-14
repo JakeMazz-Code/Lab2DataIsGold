@@ -11,8 +11,7 @@ DAY_TOKENS = ["M", "Tu", "W", "Th", "F", "Sa", "Su"]
 def _split_compact_days(s: str) -> List[str]:
     """
     Accepts Columbia-style compact day strings like:
-    - 'MWF', 'TR', 'M', 'W', 'F', 'S', 'U'
-    - Also supports 'Tu', 'Th' inline if present
+      'MWF', 'TR', 'M', 'W', 'F', 'S', 'U', and mixed 'TuTh'.
     Mapping:
       M->M, T->Tu, W->W, R->Th, F->F, S->Sa, U->Su
     """
@@ -31,7 +30,7 @@ def _split_compact_days(s: str) -> List[str]:
             out.append("Tu"); i += 2; continue
         # Single letters
         if ch == "M": out.append("M"); i += 1; continue
-        if ch == "T": out.append("Tu"); i += 1; continue  # assume Tuesday
+        if ch == "T": out.append("Tu"); i += 1; continue
         if ch == "W": out.append("W"); i += 1; continue
         if ch == "R": out.append("Th"); i += 1; continue
         if ch == "F": out.append("F"); i += 1; continue
@@ -93,6 +92,7 @@ class Section(BaseModel):
     section: Optional[str] = None
     instructor: Optional[str] = None
     status: Optional[str] = None
+    component: Optional[str] = None  # <-- NEW: Lecture / Recitation / Lab / Seminar ...
     meetings: List[Meeting] = []
 
 class Course(BaseModel):
