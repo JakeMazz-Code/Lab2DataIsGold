@@ -1,139 +1,117 @@
 # src/validators.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, validator, root_validator
+
 import json
-import re
-import os
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Any
 
-DAY_TOKENS = ["M", "Tu", "W", "Th", "F", "Sa", "Su"]
+WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-def _split_compact_days(s: str) -> List[str]:
-    """
-    Accepts Columbia-style compact day strings like:
-      'MWF', 'TR', 'M', 'W', 'F', 'S', 'U', and mixed 'TuTh'.
-    Mapping:
-      M->M, T->Tu, W->W, R->Th, F->F, S->Sa, U->Su
-    """
-    s = (s or "").strip().upper().replace(" ", "").replace(".", "")
-    if not s:
-        return []
-    out: List[str] = []
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        nxt = s[i+1] if i + 1 < len(s) else ""
-        # Two-letter tokens first
-        if ch == "T" and nxt == "H":
-            out.append("Th"); i += 2; continue
-        if ch == "T" and nxt == "U":
-            out.append("Tu"); i += 2; continue
-        # Single letters
-        if ch == "M": out.append("M"); i += 1; continue
-        if ch == "T": out.append("Tu"); i += 1; continue
-        if ch == "W": out.append("W"); i += 1; continue
-        if ch == "R": out.append("Th"); i += 1; continue
-        if ch == "F": out.append("F"); i += 1; continue
-        if ch == "S": out.append("Sa"); i += 1; continue
-        if ch == "U": out.append("Su"); i += 1; continue
-        i += 1
-    # Dedup preserving order
-    seen = set(); dedup = []
-    for d in out:
-        if d not in seen:
-            seen.add(d); dedup.append(d)
-    return dedup
-
-def _validate_time_str(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    if not re.match(r"^\d{2}:\d{2}$", s):
-        raise ValueError(f"Time must be HH:MM (24h); got {s}")
-    hh, mm = s.split(":")
-    h, m = int(hh), int(mm)
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError(f"Invalid time range: {s}")
-    return s
-
-class Location(BaseModel):
+@dataclass
+class Location:
     campus: Optional[str] = None
     building: Optional[str] = None
     room: Optional[str] = None
 
-class Meeting(BaseModel):
-    days: List[str]
-    start_time: Optional[str] = None  # "HH:MM" 24h
-    end_time: Optional[str] = None    # "HH:MM" 24h
-    time_tba: bool = False
-    location: Optional[Location] = None
-
-    @validator("days", pre=True)
-    def normalize_days(cls, v):
-        if isinstance(v, str):
-            v = _split_compact_days(v)
-        v = [d.strip() for d in v or []]
-        # Dedup preserve order; only keep known tokens
-        out, seen = [], set()
-        for d in v:
-            if d in DAY_TOKENS and d not in seen:
-                out.append(d); seen.add(d)
-        return out
-
-    @validator("start_time", "end_time", pre=True, always=True)
-    def _validate_time(cls, v, values):
-        time_tba = values.get("time_tba", False)
-        if time_tba and v is None:
-            return None
-        return _validate_time_str(v) if v is not None else None
-
-class Section(BaseModel):
-    term: str
-    crn: Optional[str] = None
-    section: Optional[str] = None
-    instructor: Optional[str] = None
-    status: Optional[str] = None
-    component: Optional[str] = None  # <-- NEW: Lecture / Recitation / Lab / Seminar ...
-    meetings: List[Meeting] = []
-
-class Course(BaseModel):
+@dataclass
+class Section:
     university: str
-    subject: str
-    number: str
-    course_code: str
-    title: str
-    credits: Union[int, float, str]
-    description: Optional[str] = None
-    prerequisites: Optional[str] = None
-    sections: List[Section] = []
+    term: str                     # "Fall 2025"
+    subject: str                  # "COMS"
+    number: str                   # "W4701"
+    course_code: str              # "COMS W4701"
+    section: str                  # "001", "R01", etc.
+    crn: Optional[str] = None
+    title: Optional[str] = None
+    credits_min: Optional[float] = None
+    credits_max: Optional[float] = None
+    credits: Optional[float] = None       # if fixed
+    days: List[str] = field(default_factory=list)
+    start_time: Optional[str] = None      # "HH:MM"
+    end_time: Optional[str] = None
+    location: Location = field(default_factory=Location)
+    instructor: Optional[str] = None
+    component: Optional[str] = None       # "LECTURE", "SEMINAR", "LAB", "RECITATION", ...
+    is_recitation: bool = False
+    parent_course_code: Optional[str] = None
+    detail_url: Optional[str] = None
+    short_desc: Optional[str] = None
+    status: Optional[str] = None
 
-    @root_validator(pre=True)
-    def coerce_credits(cls, values):
-        cr = values.get("credits")
-        if isinstance(cr, str):
-            s = cr.strip()
-            try:
-                if s and s.replace(".", "", 1).isdigit():
-                    values["credits"] = float(s) if "." in s else int(s)
-            except Exception:
-                pass
-        return values
+    def to_row(self) -> Dict[str, Any]:
+        """Flat row for DataFrame display."""
+        return {
+            "course_code": self.course_code,
+            "title": self.title,
+            "credits": self.credits if self.credits is not None else self.credits_max or self.credits_min,
+            "credits_min": self.credits_min,
+            "credits_max": self.credits_max,
+            "term": self.term,
+            "subject": self.subject,
+            "number": self.number,
+            "section": self.section,
+            "crn": self.crn,
+            "instructor": self.instructor,
+            "component": self.component,
+            "is_recitation": self.is_recitation,
+            "parent_course_code": self.parent_course_code,
+            "days": ", ".join(self.days) if self.days else None,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "location": " ".join([x for x in [self.location.building, self.location.room] if x]) if self.location else None,
+            "detail_url": self.detail_url,
+            "short_desc": self.short_desc,
+            "status": self.status,
+        }
 
-def to_jsonable(obj: Course) -> Dict[str, Any]:
-    import json as _json
-    return _json.loads(obj.json())
+def normalize_sections(raw_sections: List[Dict[str, Any]]) -> List[Section]:
+    """Convert raw dicts (from scraper) into validated Section dataclass instances."""
+    normalized: List[Section] = []
+    for r in raw_sections:
+        loc = r.get("location") or {}
+        section = Section(
+            university=r.get("university", "Columbia University"),
+            term=r.get("term"),
+            subject=r.get("subject"),
+            number=r.get("number"),
+            course_code=r.get("course_code"),
+            section=r.get("section"),
+            crn=r.get("crn"),
+            title=r.get("title"),
+            credits_min=r.get("credits_min"),
+            credits_max=r.get("credits_max"),
+            credits=r.get("credits"),
+            days=r.get("days") or [],
+            start_time=r.get("start_time"),
+            end_time=r.get("end_time"),
+            location=Location(
+                campus=loc.get("campus"),
+                building=loc.get("building"),
+                room=loc.get("room"),
+            ),
+            instructor=r.get("instructor"),
+            component=r.get("component"),
+            is_recitation=bool(r.get("is_recitation")),
+            parent_course_code=r.get("parent_course_code"),
+            detail_url=r.get("detail_url"),
+            short_desc=r.get("short_desc"),
+            status=r.get("status"),
+        )
+        normalized.append(section)
+    return normalized
 
-def write_json(path: str, courses: List[Course]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def flatten_for_display(sections: List[Section]) -> List[Dict[str, Any]]:
+    """List of rows for DataFrame."""
+    return [s.to_row() for s in sections]
+
+DISPLAY_COLS = [
+    "course_code", "title", "credits", "term", "subject", "number",
+    "section", "crn", "instructor", "component", "is_recitation",
+    "parent_course_code", "days", "start_time", "end_time", "location",
+    "detail_url"
+]
+
+def write_json(path: str, sections: List[Section]) -> None:
+    payload = [asdict(s) for s in sections]
     with open(path, "w", encoding="utf-8") as f:
-        json.dump([json.loads(c.json()) for c in courses], f, ensure_ascii=False, indent=2)
-
-def read_json(path: str) -> List[Course]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return [Course(**d) for d in data]
-
-if __name__ == "__main__":
-    assert _split_compact_days("MWF") == ["M", "W", "F"]
-    assert _split_compact_days("TR") == ["Tu", "Th"]
-    assert _split_compact_days("TuTh") == ["Tu", "Th"]
-    print("validators.py basic checks: OK")
+        json.dump(payload, f, ensure_ascii=False, indent=2)

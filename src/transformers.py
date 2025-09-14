@@ -1,459 +1,609 @@
 # src/transformers.py
 from __future__ import annotations
-import argparse
-import datetime
-import json
+
 import os
-from typing import Any, Dict, List, Optional, Union
-from collections import defaultdict
+from datetime import datetime, time as dtime
+from typing import Dict, List, Optional, Tuple
 
+import altair as alt
 import pandas as pd
-from dateutil import parser as dtparser
+import requests
+import streamlit as st
 
-from validators import Course, read_json
-# NEW: allow in-app scraping for UX
-try:
-    from scraper import ColumbiaDOCScraper
-except Exception:
-    ColumbiaDOCScraper = None  # still ok if you only use pre-scraped files
+from scraper import (
+    discover_subjects_for_term,
+    scrape_many,
+    term_to_sis_code,
+    term_human,
+)
+from validators import normalize_sections, flatten_for_display, DISPLAY_COLS, write_json
 
-DAY_ORDER = ["M", "Tu", "W", "Th", "F", "Sa", "Su"]
+# ----------------
+# Page config & UI
+# ----------------
+st.set_page_config(
+    page_title="Columbia Course Finder (Demo)",
+    page_icon="🎓",
+    layout="wide",
+)
 
-# ----------------- time & credits helpers -----------------
+# Subtle CSS polish
+st.markdown("""
+<style>
+.block-container { padding-top: 0.8rem; padding-bottom: 2rem; }
+.small-muted { color: #6b7280; font-size: 0.9rem; }
+.badge { display:inline-block; padding: 0.1rem 0.45rem; border-radius: 0.35rem; background:#eef2ff; margin-right:0.25rem; font-size:0.85rem; }
+.rec-badge { background:#fef3c7; }
+.lec-badge { background:#dcfce7; }
+.lab-badge { background:#e0f2fe; }
+.semi-badge { background:#fce7f3; }
+a:link, a:visited { color: #2563eb; text-decoration: none;}
+a:hover { text-decoration: underline; }
+.stProgress > div > div > div > div { background-color: #10b981; }
+hr { border: none; border-top: 1px solid #e5e7eb; margin: 0.75rem 0 1rem; }
+.kpi-card { background: #fafafa; border: 1px solid #eee; padding: 0.75rem 1rem; border-radius: 0.5rem; }
+</style>
+""", unsafe_allow_html=True)
 
-def parse_time_to_24h(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = s.strip()
-    if not s or s.upper() in {"TBA", "ARR", "ARRANGED"}:
-        return None
-    s = s.replace("Noon", "12:00 PM").replace("noon", "12:00 PM")
-    s = s.replace("Midnight", "12:00 AM").replace("midnight", "12:00 AM")
+# --------------
+# Cache helpers
+# --------------
+@st.cache_data(show_spinner=False, ttl=60*60)  # 1 hour
+def cached_discover_subjects(term: str) -> List[Dict[str, str]]:
+    session = requests.Session()
+    return discover_subjects_for_term(term, session)
+
+@st.cache_data(show_spinner=True, ttl=60*5)  # 5 min
+def cached_scrape(subjects: List[str], term: str) -> List[Dict]:
+    session = requests.Session()
+    return scrape_many(subjects, term, session)
+
+# -----------------
+# Helper functions
+# -----------------
+WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+def ensure_display_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guarantee that DISPLAY_COLS exist (used by UI tables).
+    We DO NOT assume credits_min/max exist; credits filtering now uses safe .get().
+    """
+    out = df.copy()
+    for c in set(DISPLAY_COLS) - set(out.columns):
+        out[c] = None
+    return out.reindex(columns=DISPLAY_COLS)
+
+def compute_metrics(df: pd.DataFrame) -> Dict[str, int]:
+    return {
+        "sections": len(df),
+        "courses": df["course_code"].nunique() if "course_code" in df.columns else 0,
+        "subjects": df["subject"].nunique() if "subject" in df.columns else 0,
+        "recitations": int((df.get("is_recitation", pd.Series(dtype=bool)) == True).sum()),
+        "primaries": int((df.get("is_recitation", pd.Series(dtype=bool)) == False).sum()),
+    }
+
+def explode_days(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in df.iterrows():
+        days_raw = r.get("days") or ""
+        days = [d.strip() for d in str(days_raw).split(",") if d.strip()]
+        for d in days:
+            rows.append({
+                "course_code": r.get("course_code"),
+                "is_recitation": r.get("is_recitation"),
+                "day": d,
+                "start_time": r.get("start_time"),
+                "end_time": r.get("end_time"),
+                "credits": r.get("credits") if pd.notnull(r.get("credits")) else (r.get("credits_max") or r.get("credits_min")),
+                "instructor": r.get("instructor"),
+                "building": (r.get("location") or ""),
+                "component": r.get("component"),
+            })
+    return pd.DataFrame(rows)
+
+def hhmm_to_hour(hhmm: Optional[str]) -> Optional[float]:
+    if hhmm is None or pd.isna(hhmm): return None
     try:
-        t = dtparser.parse(s, fuzzy=True)
-        return t.strftime("%H:%M")
+        h, m = [int(x) for x in str(hhmm).split(":")]
+        return h + m / 60.0
     except Exception:
-        if s.endswith("a") or s.endswith("p"):
+        return None
+
+def make_pipeline_dot() -> str:
+    # A tiny DOT graph explaining the flow
+    return r"""
+digraph G {
+    rankdir=LR;
+    node [shape=roundrect, style=filled, color="#4f46e5", fillcolor="#eef2ff", fontname="Helvetica"];
+    edge [color="#9ca3af"];
+
+    A [label="1) Discover subjects\n(A–Z pages for chosen term)"];
+    B [label="2) Scrape selections\n(Subject pages → plain text)"];
+    C [label="3) Parse sections\n(Number, Sec, Points, Day/Time, Room,\nBuilding, Faculty)"];
+    D [label="4) Link recitations\n(R## or 0 points → parent lecture)"];
+    E [label="5) Normalize & cache\n(validated schema)"];
+    F [label="6) Filter & browse\n(credits, days, time, text)"];
+    G [label="7) Visualize & export\n(KPIs, charts, deck, CSV/JSON)"];
+
+    A -> B -> C -> D -> E -> F -> G;
+}
+"""
+
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def credit_bounds(row: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Robustly compute [__cmin, __cmax] for a row.
+    - If fixed credits: [c, c]
+    - If variable credits: [credits_min, credits_max] (fallback if only one is present)
+    - If unknown: [None, None]
+    Uses .get() so missing columns never crash.
+    """
+    c  = _to_float(row.get("credits"))
+    cmin = _to_float(row.get("credits_min"))
+    cmax = _to_float(row.get("credits_max"))
+
+    if c is not None:
+        return c, c
+    if cmin is None and cmax is None:
+        return None, None
+    if cmin is None:
+        cmin = cmax
+    if cmax is None:
+        cmax = cmin
+    if cmax < cmin:
+        cmin, cmax = cmax, cmin
+    return cmin, cmax
+
+def build_html_deck(term_label: str, metrics: Dict[str, int], sample_html_table: str) -> str:
+    # A self-contained mini deck (no external assets). Great for emailing or presenting.
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Columbia Course Finder — Demo Deck</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#111827; }}
+  .slide {{ width: 100%; height: 100vh; padding: 4rem 6vw; box-sizing: border-box; display:flex; flex-direction:column; justify-content:center; }}
+  h1,h2,h3 {{ margin: 0 0 0.75rem; }}
+  .muted {{ color:#6b7280; }}
+  .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; margin-top: 1rem; }}
+  .card {{ border:1px solid #e5e7eb; border-radius:8px; padding: 12px; background:#fafafa; }}
+  .code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background:#f3f4f6; padding: 2px 4px; border-radius: 4px; }}
+  .table-wrap {{ max-height: 50vh; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; }}
+  footer {{ position: fixed; bottom: 10px; right: 16px; font-size: 12px; color:#9ca3af; }}
+</style>
+</head>
+<body>
+
+<section class="slide">
+  <h1>Columbia Course Finder</h1>
+  <h3 class="muted">Term: {term_label}</h3>
+  <p>A scraping demo that discovers subjects, scrapes the Directory of Classes, links recitations to their parent lectures, and presents a student-friendly search UI.</p>
+</section>
+
+<section class="slide">
+  <h2>Pipeline</h2>
+  <ol>
+    <li>Discover subjects for the chosen term (A–Z index)</li>
+    <li>Scrape selected or ALL subjects (plain text listings)</li>
+    <li>Parse sections (number, points, day/time, room, instructor)</li>
+    <li>Link recitations (0 points or R##) to parent lectures</li>
+    <li>Normalize schema → dashboard filters & visuals</li>
+  </ol>
+</section>
+
+<section class="slide">
+  <h2>Key metrics</h2>
+  <div class="kpis">
+    <div class="card"><strong>Sections</strong><div>{metrics["sections"]}</div></div>
+    <div class="card"><strong>Courses</strong><div>{metrics["courses"]}</div></div>
+    <div class="card"><strong>Subjects</strong><div>{metrics["subjects"]}</div></div>
+    <div class="card"><strong>Primaries</strong><div>{metrics["primaries"]}</div></div>
+    <div class="card"><strong>Recitations</strong><div>{metrics["recitations"]}</div></div>
+  </div>
+</section>
+
+<section class="slide">
+  <h2>Sample results</h2>
+  <div class="table-wrap">{sample_html_table}</div>
+  <p class="muted">Tip: Full CSV/JSON available from the Export tab.</p>
+</section>
+
+<footer>Generated {datetime.utcnow().isoformat(timespec="seconds")}Z</footer>
+</body>
+</html>"""
+
+# ----------------
+# Sidebar controls
+# ----------------
+st.sidebar.title("🎓 Columbia Course Finder")
+st.sidebar.markdown("**Proof-of-concept:** discover → scrape → filter → visualize → export.")
+
+# Term selection
+term_input = st.sidebar.selectbox("Term", ["Fall 2025", "Summer 2025", "Spring 2026"], index=0)
+term_label = term_human(term_input)
+term_code = term_to_sis_code(term_input)
+
+# Demo mode
+demo_mode = st.sidebar.toggle("🎬 Demo Mode (recording‑friendly)", value=True,
+                              help="Uses curated defaults (e.g., COMS/STAT) and caps subjects for a fast, reproducible demo.")
+
+# Discover subjects immediately (fast A–Z scrape)
+with st.spinner("Discovering subjects for the term…"):
+    subjects_list = cached_discover_subjects(term_input)  # [{"code":"COMS","name":"Computer Science"},...]
+subject_options = [f"{s['code']} — {s['name']}" for s in subjects_list]
+code_by_option = {f"{s['code']} — {s['name']}": s["code"] for s in subjects_list}
+st.sidebar.success(f"Loaded {len(subjects_list)} subjects for {term_label}")
+
+st.sidebar.markdown("---")
+
+# Selection controls
+if demo_mode:
+    st.sidebar.info("Demo suggestion: scrape **COMS** and **STAT** first, then try **ALL**.")
+    default_sel = [opt for opt in subject_options if opt.startswith("COMS")] + \
+                  [opt for opt in subject_options if opt.startswith("STAT")]
+    default_sel = default_sel[:2] or subject_options[:2]
+    cap_default = 8
+else:
+    default_sel = [opt for opt in subject_options if opt.startswith("COMS")]
+    cap_default = 10
+
+all_flag = st.sidebar.checkbox("Scrape **ALL** subjects", value=False)
+selected_options = [] if all_flag else st.sidebar.multiselect(
+    "Pick subjects (or choose ALL):",
+    options=subject_options,
+    default=default_sel
+)
+
+max_subjects = st.sidebar.number_input("Cap subjects (testing)", min_value=1, step=1, value=cap_default,
+                                       help="Use to test a smaller scrape when 'ALL' is selected.")
+go = st.sidebar.button("🚀 Scrape now")
+
+# Session state to hold scraped sections
+if "sections_raw" not in st.session_state:
+    st.session_state["sections_raw"] = []
+if "sections_df" not in st.session_state:
+    st.session_state["sections_df"] = pd.DataFrame()
+
+# Kick off scrape when user clicks
+if go:
+    if all_flag:
+        subject_codes = [s["code"] for s in subjects_list][:max_subjects]
+    else:
+        if not selected_options:
+            st.warning("Please select at least one subject or check **ALL**.")
+            st.stop()
+        subject_codes = [code_by_option[o] for o in selected_options]
+
+    st.info(f"Scraping **{len(subject_codes)}** subject(s)…")
+    with st.spinner("Scraping…"):
+        raw = cached_scrape(subject_codes, term_input)
+
+    # Normalize & flatten
+    sections = normalize_sections(raw)
+    rows = flatten_for_display(sections)
+    df = pd.DataFrame(rows)
+    df = ensure_display_cols(df)
+
+    st.session_state["sections_raw"] = raw
+    st.session_state["sections_df"] = df
+
+# ------------------------
+# Main tabs (demo-friendly)
+# ------------------------
+st.title("Columbia Course Finder")
+st.caption(f"Term: **{term_label}** • Data source: Directory of Classes (DOC) — subject A–Z → per‑term → plain‑text listings. "
+           "Recitations are linked to parent lectures when disclosed on section detail pages.")
+
+tab_search, tab_visuals, tab_how, tab_export = st.tabs(["🔎 Search", "📊 Visuals", "🛠️ How it works", "📤 Export"])
+
+# ===========
+# SEARCH TAB
+# ===========
+with tab_search:
+    if st.session_state["sections_df"].empty:
+        st.info("No results yet. Choose subjects on the left and click **Scrape now**.")
+    else:
+        st.subheader("Filters")
+
+        f1, f2, f3, f4 = st.columns([1, 1, 2, 2])
+        with f1:
+            credits_min = st.number_input("Min credits", value=0.0, step=0.5)
+        with f2:
+            credits_max = st.number_input("Max credits", value=6.0, step=0.5)
+
+        with f3:
+            WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            day_choices = st.multiselect("Days", WEEKDAY_ORDER, default=[], help="Filter by meeting days.")
+        with f4:
+            time_filter = st.checkbox("Filter by time window", value=False)
+            if time_filter:
+                c1, c2 = st.columns(2)
+                with c1:
+                    start_after = st.time_input("Start at or after", value=dtime(0, 0))
+                with c2:
+                    end_before = st.time_input("End at or before", value=dtime(23, 59))
+            else:
+                start_after = None
+                end_before = None
+
+        include_recitations_in_time = st.checkbox(
+            "Apply day/time filter to **recitations as well**",
+            value=False,
+            help="If off, day/time filter applies only to primary sections (is_recitation==False)."
+        )
+        query = st.text_input("Keyword (title/instructor/building)", value="")
+
+        # Apply filters
+        df = st.session_state["sections_df"].copy()
+
+        # ---- CREDITS FILTER (robust, interval-based) ----
+        bounds = df.apply(lambda r: pd.Series(credit_bounds(r), index=["__cmin", "__cmax"]), axis=1)
+        df = pd.concat([df, bounds], axis=1)
+
+        def credits_overlap(row) -> bool:
+            cmin, cmax = row.get("__cmin"), row.get("__cmax")
+            # If credits unknown, include by default (so we don't drop courses with missing data)
+            if pd.isna(cmin) and pd.isna(cmax):
+                return True
+            if pd.isna(cmin): cmin = cmax
+            if pd.isna(cmax): cmax = cmin
+            return not (cmax < credits_min or cmin > credits_max)
+
+        mask = df.apply(credits_overlap, axis=1)
+
+        # ---- DAY/TIME FILTERS ----
+        def row_matches_day(row) -> bool:
+            if not day_choices:
+                return True
+            days = [d.strip() for d in str(row.get("days") or "").split(",") if d.strip()]
+            if not days:
+                return False
+            return any(d in days for d in day_choices)
+
+        def hhmm_to_minutes(hhmm: str) -> Optional[int]:
             try:
-                t = dtparser.parse(s + "m", fuzzy=True)
-                return t.strftime("%H:%M")
+                h, m = [int(x) for x in str(hhmm).split(":")]
+                return h * 60 + m
             except Exception:
                 return None
-        return None
 
-def normalize_credits(raw: Union[str, int, float, None]) -> Union[int, float, str, None]:
-    if raw is None:
-        return None
-    if isinstance(raw, (int, float)):
-        return raw
-    s = str(raw).strip()
-    try:
-        return float(s) if "." in s else int(s)
-    except Exception:
-        return s
+        def row_matches_time(row) -> bool:
+            if not time_filter:
+                return True
+            s, e = row.get("start_time"), row.get("end_time")
+            s_min, e_min = hhmm_to_minutes(s), hhmm_to_minutes(e)
+            if s_min is None or e_min is None:
+                return False
+            if start_after is not None and s_min < (start_after.hour * 60 + start_after.minute):
+                return False
+            if end_before is not None and e_min > (end_before.hour * 60 + end_before.minute):
+                return False
+            return True
 
-def hhmm_to_minutes(s: Optional[str]) -> Optional[int]:
-    if s is None:
-        return None
-    hh, mm = s.split(":")
-    return int(hh) * 60 + int(mm)
-
-# ----------------- Course -> rows, with recitation awareness -----------------
-
-def _collect_recitations(courses: List[Course]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Build a map of course_code -> list of recitation meeting dicts.
-    Uses explicit Section.component when present; otherwise falls back to:
-      zero-credit OR title containing 'recit'.
-    """
-    rec_by_course: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for c in courses:
-        cr = normalize_credits(c.credits)
-        title_up = (c.title or "").upper()
-        for sec in c.sections:
-            comp = getattr(sec, "component", None)
-            is_recit = False
-            if comp and comp.lower().startswith("recit"):
-                is_recit = True
-            elif (isinstance(cr, (int, float)) and float(cr) == 0.0) or ("RECIT" in title_up):
-                is_recit = True
-            if is_recit:
-                for m in sec.meetings:
-                    rec_by_course[c.course_code].append({
-                        "days": m.days,
-                        "start_time": m.start_time,
-                        "end_time": m.end_time,
-                        "location": " ".join(filter(None, [
-                            (m.location.building if m.location else None),
-                            (m.location.room if m.location else None)
-                        ])) if m.location else None,
-                        "section": sec.section,
-                        "instructor": sec.instructor,
-                    })
-    return rec_by_course
-
-def _summarize_recitations(options: List[Dict[str, Any]], limit: int = 3) -> str:
-    """Create a short human-readable summary like 'F 10:10–11:00; Th 19:10–20:00 …'"""
-    parts = []
-    for i, o in enumerate(options):
-        if i >= limit:
-            parts.append("…")
-            break
-        days = "".join(o.get("days") or [])
-        st, et = o.get("start_time"), o.get("end_time")
-        times = f"{st}–{et}" if st and et else (st or et or "TBA")
-        loc = o.get("location")
-        parts.append(f"{days} {times}" + (f" ({loc})" if loc else ""))
-    return "; ".join(parts)
-
-def to_rows(courses: List[Course]) -> List[Dict[str, Any]]:
-    """
-    Flatten Course objects into meeting-level rows that Streamlit can display & filter,
-    and enrich rows with recitation metadata for the *same course*.
-    """
-    rows: List[Dict[str, Any]] = []
-    rec_by_course = _collect_recitations(courses)
-
-    for c in courses:
-        cr = normalize_credits(c.credits)
-        for sec in c.sections:
-            comp = getattr(sec, "component", None)
-            # Handle sections without explicit meeting blocks (rare but possible)
-            if not sec.meetings:
-                rows.append({
-                    "university": c.university,
-                    "subject": c.subject,
-                    "course_code": c.course_code,
-                    "title": c.title,
-                    "credits": cr,
-                    "term": sec.term,
-                    "section": sec.section,
-                    "crn": sec.crn,
-                    "instructor": sec.instructor,
-                    "component": comp,
-                    "days": [],
-                    "start_time": None,
-                    "end_time": None,
-                    "start_minutes": None,
-                    "end_minutes": None,
-                    "location": None,
-                    "has_recitation": len(rec_by_course.get(c.course_code, [])) > 0,
-                    "recitation_options": rec_by_course.get(c.course_code, []),
-                    "recitation_summary": _summarize_recitations(rec_by_course.get(c.course_code, [])),
-                    "short_desc": (c.description or "")[:140].strip(),
-                })
-                continue
-
-            for m in sec.meetings:
-                st, et = m.start_time, m.end_time
-                rows.append({
-                    "university": c.university,
-                    "subject": c.subject,
-                    "course_code": c.course_code,
-                    "title": c.title,
-                    "credits": cr,
-                    "term": sec.term,
-                    "section": sec.section,
-                    "crn": sec.crn,
-                    "instructor": sec.instructor,
-                    "component": comp,
-                    "days": m.days,
-                    "start_time": st,
-                    "end_time": et,
-                    "start_minutes": hhmm_to_minutes(st) if st else None,
-                    "end_minutes": hhmm_to_minutes(et) if et else None,
-                    "location": " ".join(filter(None, [
-                        (m.location.building if m.location else None),
-                        (m.location.room if m.location else None)
-                    ])) if m.location else None,
-                    "has_recitation": len(rec_by_course.get(c.course_code, [])) > 0,
-                    "recitation_options": rec_by_course.get(c.course_code, []),
-                    "recitation_summary": _summarize_recitations(rec_by_course.get(c.course_code, [])),
-                    "short_desc": (c.description or "")[:140].strip(),
-                })
-    return rows
-
-# ----------------- filtering & sorting -----------------
-
-def filter_rows(rows: List[Dict[str, Any]],
-                points: Optional[Union[int, float]] = None,
-                day: Optional[str] = None,
-                time_mode: str = "starts_at",          # "starts_at" or "overlaps"
-                time_hhmm: Optional[str] = None,
-                subject: Optional[str] = None,
-                text_query: Optional[str] = None,
-                hide_zero_credit: bool = False) -> List[Dict[str, Any]]:
-    """
-    Extended filter with subject, keyword, and 'hide 0 credit' options.
-    """
-    out = []
-    tmin = None if not time_hhmm else (int(time_hhmm[:2]) * 60 + int(time_hhmm[3:]))
-    q = (text_query or "").strip().lower()
-
-    for r in rows:
-        # Subject
-        if subject and r.get("subject") != subject:
-            continue
-
-        # Zero-credit hiding
-        if hide_zero_credit:
-            try:
-                if float(r.get("credits") or 0.0) == 0.0:
-                    continue
-            except Exception:
-                pass
-
-        # Points equality
-        if points is not None:
-            cr = r.get("credits")
-            try:
-                if float(cr) != float(points):
-                    continue
-            except Exception:
-                continue
-
-        # Day match
-        if day:
-            rdays = r.get("days") or []
-            if day not in rdays:
-                continue
-
-        # Time constraint
-        if tmin is not None:
-            sm, em = r.get("start_minutes"), r.get("end_minutes")
-            if sm is None or em is None:
-                continue
-            if time_mode == "starts_at":
-                if sm != tmin:
-                    continue
-            else:  # overlaps
-                if not (sm <= tmin <= em):
-                    continue
-
-        # Keyword search (title or instructor)
-        if q:
-            t = (r.get("title") or "").lower()
-            instr = (r.get("instructor") or "").lower()
-            if q not in t and q not in instr:
-                continue
-
-        out.append(r)
-
-    # Sort by start time then course_code
-    def sort_key(x):
-        return (
-            10**9 if x.get("start_minutes") is None else x["start_minutes"],
-            x.get("course_code") or "",
-        )
-
-    return sorted(out, key=sort_key)
-
-# ----------------- CLI driver (smoke / acceptance) -----------------
-
-def main_cli():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/sample_output.json")
-    ap.add_argument("--points", type=float, default=None)
-    ap.add_argument("--day", type=str, default=None)
-    ap.add_argument("--time", type=str, default=None)
-    ap.add_argument("--mode", type=str, default="starts_at", choices=["starts_at", "overlaps"])
-    args = ap.parse_args()
-
-    courses = read_json(args.input)
-    rows = to_rows(courses)
-    res = filter_rows(rows,
-                      points=args.points,
-                      day=args.day,
-                      time_mode=args.mode,
-                      time_hhmm=args.time)
-    print(json.dumps(res[:5], indent=2))
-
-# ----------------- Streamlit UI -----------------
-
-if __name__ == "__main__":
-    if os.getenv("ENV") == "TEST_FILTERS":
-        # Acceptance test path (uses whatever is in data/sample_output.json)
-        courses = read_json("data/sample_output.json")
-        rows = to_rows(courses)
-        out = filter_rows(rows, points=2, day="M", time_mode="starts_at", time_hhmm="16:30")
-        assert all(float(r["credits"]) == 2.0 for r in out), "Not all results are 2 credits"
-        assert all("M" in (r["days"] or []) for r in out), "Not all results are on Monday"
-        out2 = filter_rows(rows, points=2, day="M", time_mode="overlaps", time_hhmm="16:30")
-        assert len(out2) >= len(out), "Overlaps set should be >= starts_at set"
-        print("ACCEPTANCE FILTERS: OK")
-    else:
-        import sys
-        import streamlit as st
-
-        st.set_page_config(page_title="Columbia Course Finder (POC)", layout="wide")
-        # --- Light styling ---
-        st.markdown("""
-            <style>
-              .big-title { font-size: 1.8rem; font-weight: 700; margin-bottom: .2rem; }
-              .subtitle { color: #666; margin-bottom: 1rem; }
-              .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-                       background: #eef2ff; color: #334; font-size: 0.85rem; margin-right: 6px; }
-            </style>
-        """, unsafe_allow_html=True)
-        st.markdown('<div class="big-title">Columbia Course Finder — Directory of Classes</div>', unsafe_allow_html=True)
-        st.markdown('<div class="subtitle">Filter by practical criteria and see recitations at a glance.</div>', unsafe_allow_html=True)
-
-        # Resolve input path passed via "streamlit run src/transformers.py -- --input data/sample_output.json"
-        input_path = "data/sample_output.json"
-        if "--" in sys.argv:
-            i = sys.argv.index("--")
-            j = i + 1
-            while j + 1 < len(sys.argv):
-                if sys.argv[j] == "--input":
-                    input_path = sys.argv[j + 1]
-                    break
-                j += 1
-
-        # ------- Sidebar: Load data -------
-        st.sidebar.header("Load data")
-        data_source = st.sidebar.radio("Data source", options=["Existing file", "Scrape now"], index=0)
-
-        if "courses_cache" not in st.session_state:
-            st.session_state.courses_cache = None
-
-        courses: List[Course]
-        if data_source == "Existing file":
-            input_path = st.sidebar.text_input("JSON file", value=input_path)
-            if os.path.exists(input_path):
-                courses = read_json(input_path)
-                st.sidebar.success(f"Loaded {len(courses)} courses from file.")
-            else:
-                st.sidebar.error("File not found. Scrape or point to a valid JSON.")
-                courses = []
+        if include_recitations_in_time:
+            mask &= df.apply(lambda r: row_matches_day(r) and row_matches_time(r), axis=1)
         else:
-            if ColumbiaDOCScraper is None:
-                st.sidebar.error("Scraper module not available. Use the file mode or install dependencies.")
-                courses = []
-            else:
-                term = st.sidebar.text_input("Term", value="Fall2025")
-                scope = st.sidebar.radio("Scope", ["Seeded ALL subjects", "Choose subjects"], index=0)
-                throttle = st.sidebar.slider("Throttle (sec/request)", min_value=0.0, max_value=2.0, value=0.7, step=0.1)
-                enrich = st.sidebar.checkbox("Enrich descriptions & component", value=True)
-                if scope == "Choose subjects":
-                    subj_csv = st.sidebar.text_input("Subjects (comma-separated)", value="COMS,STAT")
-                    subjects = [s.strip().upper() for s in subj_csv.split(",") if s.strip()]
+            only_primary = df.get("is_recitation", False) == False
+            day_time_mask = df.apply(lambda r: row_matches_day(r) and row_matches_time(r), axis=1)
+            mask &= (~only_primary) | (only_primary & day_time_mask)
+
+        # ---- TEXT QUERY ----
+        if query.strip():
+            q = query.strip().lower()
+            def matches_q(row) -> bool:
+                hay = " ".join([
+                    str(row.get("title") or ""),
+                    str(row.get("instructor") or ""),
+                    str(row.get("location") or ""),
+                    str(row.get("course_code") or ""),
+                ]).lower()
+                return q in hay
+            mask &= df.apply(matches_q, axis=1)
+
+        filtered = df[mask].copy().reset_index(drop=True)
+
+        st.markdown(f"**{len(filtered)}** matching sections")
+        st.dataframe(filtered.reindex(columns=DISPLAY_COLS), use_container_width=True, hide_index=True)
+
+        st.subheader("Browse by Course (expand for sections & recitations)")
+        grouped = filtered.groupby("course_code", sort=True) if "course_code" in filtered.columns else []
+        for course_code, g in grouped:
+            title = g["title"].dropna().unique() if "title" in g.columns else []
+            pretty_title = title[0] if len(title) else ""
+            chip = f"<span class='badge lec-badge'>{pretty_title}</span>"
+            st.markdown(f"### {course_code} &nbsp; {chip}", unsafe_allow_html=True)
+
+            with st.expander("Show sections"):
+                prim = g[g.get("is_recitation", False) == False].copy()
+                recs = g[g.get("is_recitation", False) == True].copy()
+
+                if not prim.empty:
+                    st.markdown("**Primary**")
+                    cols = ["section", "crn", "component", "instructor",
+                            "days", "start_time", "end_time", "location", "detail_url"]
+                    prim_display = prim[[c for c in cols if c in prim.columns]].rename(columns={"detail_url": "DOC link"})
+                    if "DOC link" in prim_display.columns:
+                        prim_display["DOC link"] = prim_display["DOC link"].apply(lambda u: f"[open]({u})" if pd.notnull(u) else "")
+                    st.dataframe(prim_display, use_container_width=True, hide_index=True)
                 else:
-                    subjects = ColumbiaDOCScraper.load_subjects_seed(None)
+                    st.write("_No primary sections shown in current filter._")
 
-                if st.sidebar.button("Scrape now"):
-                    scraper = ColumbiaDOCScraper(term_label=term, subjects=subjects, throttle=throttle, enrich_descriptions=enrich)
-                    progress = st.sidebar.progress(0.0, text="Scraping...")
-                    collected: List[Course] = []
-                    for idx, s in enumerate(subjects, start=1):
-                        try:
-                            collected.extend(scraper.scrape_subject(s))
-                        except Exception as e:
-                            st.sidebar.warning(f"{s}: {e}")
-                        progress.progress(idx / max(1, len(subjects)), text=f"Scraped {idx}/{len(subjects)} subjects")
-                    st.session_state.courses_cache = collected
-                    st.sidebar.success(f"Scraped {len(collected)} courses.")
-                courses = st.session_state.courses_cache or []
+                if not recs.empty:
+                    st.markdown("**Linked recitations/labs/discussions**")
+                    cols = ["section", "parent_course_code", "component", "instructor",
+                            "days", "start_time", "end_time", "location", "detail_url"]
+                    rec_display = recs[[c for c in cols if c in recs.columns]].rename(columns={"detail_url": "DOC link"})
+                    if "DOC link" in rec_display.columns:
+                        rec_display["DOC link"] = rec_display["DOC link"].apply(lambda u: f"[open]({u})" if pd.notnull(u) else "")
+                    st.dataframe(rec_display, use_container_width=True, hide_index=True)
+                else:
+                    st.write("_No recitations linked or shown in current filter._")
 
-        # Early exit if no courses
-        if not courses:
-            st.info("Load data from file or run a scrape to begin.")
-            st.stop()
+# ===========
+# VISUALS TAB
+# ===========
+with tab_visuals:
+    if st.session_state["sections_df"].empty:
+        st.info("Scrape some subjects to see visuals.")
+    else:
+        st.subheader("Pipeline overview")
+        st.graphviz_chart(make_pipeline_dot(), use_container_width=True)
 
-        # Flatten to rows (recitation-aware)
-        rows = to_rows(courses)
+        st.subheader("Key metrics")
+        met = compute_metrics(st.session_state["sections_df"])
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Sections", met["sections"])
+        c2.metric("Courses", met["courses"])
+        c3.metric("Subjects", met["subjects"])
+        c4.metric("Primaries", met["primaries"])
+        c5.metric("Recitations", met["recitations"])
 
-        # ------- Sidebar: Filters -------
-        st.sidebar.header("Filters")
-        # Optional points filter (off by default to avoid zero results)
-        pts_enabled = st.sidebar.checkbox("Filter by points (credits)?", value=False)
-        pts_value = st.sidebar.number_input(
-            "Points (credits)", min_value=0.0, max_value=10.0, value=2.0, step=0.5, disabled=not pts_enabled
-        )
-        pts = pts_value if pts_enabled else None
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.subheader("Distributions & schedule")
 
-        # Subject list from data
-        subjects_present = sorted({r.get("subject") for r in rows if r.get("subject")})
-        subject = st.sidebar.selectbox("Subject", options=["(Any)"] + subjects_present, index=0)
-        subject = None if subject == "(Any)" else subject
+        # Build an exploded frame by day for charting
+        base_df = st.session_state["sections_df"].copy()
+        exploded = explode_days(base_df)
+        if exploded.empty:
+            st.info("No day/time data available for charts.")
+        else:
+            exploded["start_hour"] = exploded["start_time"].apply(hhmm_to_hour)
+            exploded = exploded[exploded["day"].isin(WEEKDAY_ORDER)]
 
-        # Day + Time
-        day = st.sidebar.selectbox("Day", options=["(Any)", "M", "Tu", "W", "Th", "F", "Sa", "Su"], index=0)
-        day = None if day == "(Any)" else day
+            # Sections per weekday (primaries only)
+            prim = exploded[exploded.get("is_recitation", False) == False]
+            if not prim.empty:
+                weekday_counts = prim.groupby("day").size().reindex(WEEKDAY_ORDER, fill_value=0).reset_index(name="count")
+                st.markdown("**Sections by weekday (primaries)**")
+                st.bar_chart(weekday_counts.set_index("day"))
 
-        mode = st.sidebar.radio("Time mode", options=["starts_at", "overlaps"], index=0)
-        time_enabled = st.sidebar.checkbox("Filter by time?", value=False)
-        time_hhmm: Optional[str] = None
-        if time_enabled:
-            default_time = datetime.time(16, 30)
-            time_label = st.sidebar.time_input("Time (24h)", value=default_time, step=300)
-            time_hhmm = time_label.strftime("%H:%M")
+            # Credits distribution (all)
+            credits_df = exploded.dropna(subset=["credits"])
+            if not credits_df.empty:
+                st.markdown("**Credits distribution**")
+                hist = alt.Chart(credits_df).mark_bar().encode(
+                    x=alt.X("credits:Q", bin=alt.Bin(step=1), title="Credits"),
+                    y=alt.Y("count()", title="Sections")
+                ).properties(height=220, width="container")
+                st.altair_chart(hist, use_container_width=True)
 
-        # Keyword & credit tweaks
-        text_query = st.sidebar.text_input("Keyword (title or instructor)", value="")
-        hide_zero = st.sidebar.checkbox("Hide 0‑credit components", value=True)
+            # Start time heatmap (all)
+            heat_df = exploded.dropna(subset=["start_hour"])
+            if not heat_df.empty:
+                st.markdown("**Schedule heatmap (start hours by weekday)**")
+                heat = alt.Chart(heat_df).mark_rect().encode(
+                    x=alt.X("day:N", sort=WEEKDAY_ORDER, title="Day"),
+                    y=alt.Y("start_hour:Q", bin=alt.Bin(step=1), title="Start hour"),
+                    color=alt.Color("count():Q", title="Sections"),
+                    tooltip=["day:N", alt.Tooltip("start_hour:Q", format=".1f"), alt.Tooltip("count():Q")]
+                ).properties(height=260, width="container")
+                st.altair_chart(heat, use_container_width=True)
 
-        # Compute filtered set
-        filtered = filter_rows(
-            rows, points=pts, day=day, time_mode=mode, time_hhmm=time_hhmm,
-            subject=subject, text_query=text_query, hide_zero_credit=hide_zero
-        )
+# =================
+# HOW IT WORKS TAB
+# =================
+with tab_how:
+    st.subheader("What the app does")
+    st.markdown("""
+1. **Discover** the official subject list for your chosen term from Columbia's DOC A–Z index.
+2. **Scrape** either ALL or selected subjects using the **plain‑text listings** (stable columns).
+3. **Parse** sections: number, section, points (credits), day/time, room, building, instructor.
+4. **Link recitations** (0 credits or `R##`) back to their parent lectures (from section detail pages, when disclosed).
+5. **Normalize** into a consistent schema for filtering/searching.
+6. **Visualize & export** (KPIs, charts, CSV/JSON, self‑contained HTML deck).
+""")
+    st.info("Tip for recording: enable **Demo Mode** in the sidebar, scrape COMS/STAT, then show the Visuals tab and expand a few courses.")
 
-        # ------- Topline metrics -------
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Courses (loaded)", f"{len(courses):,}")
-        c2.metric("Meetings (rows)", f"{len(rows):,}")
-        c3.metric("Matches", f"{len(filtered):,}")
+# ===========
+# EXPORT TAB
+# ===========
+with tab_export:
+    st.subheader("Save / Download / Generate deck")
 
-        # Diagnostics (collapsible)
-        with st.expander("Diagnostics", expanded=False):
-            st.write({
-                "courses_count": len(courses),
-                "rows_count": len(rows),
-                "filtered_count": len(filtered),
-                "using_points": pts if pts is not None else "(none)",
-                "using_day": day if day else "(none)",
-                "time_mode": mode,
-                "time_hhmm": time_hhmm if time_hhmm else "(none)",
-                "subject": subject or "(Any)"
-            })
-            if rows:
-                st.text(f"Row keys sample: {list(rows[0].keys())}")
+    if st.session_state["sections_df"].empty:
+        st.info("Scrape results first to export.")
+    else:
+        colA, colB, colC = st.columns([1,1,2])
 
-        st.caption(f"{len(filtered)} matching meeting(s). Sorted by start time.")
+        with colA:
+            if st.button("💾 Save full JSON to data/columbia_sections.json"):
+                sections = normalize_sections(st.session_state["sections_raw"])
+                os.makedirs("data", exist_ok=True)
+                write_json("data/columbia_sections.json", sections)
+                st.success("Saved to data/columbia_sections.json")
 
-        show_recits = st.checkbox("Show recitation info", value=True)
+        with colB:
+            csv = st.session_state["sections_df"].to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download all sections (CSV)", data=csv,
+                               file_name="all_sections.csv", mime="text/csv")
 
-        # Columns to display
-        base_cols = [
-            "course_code", "title", "credits", "term", "section", "crn",
-            "instructor", "component", "days", "start_time", "end_time",
-            "location", "short_desc"
-        ]
-        if show_recits:
-            base_cols += ["has_recitation", "recitation_summary"]
+        with colC:
+            # Build a simple self-contained HTML deck
+            df = st.session_state["sections_df"]
+            metrics = compute_metrics(df)
+            sample_cols = [c for c in ["course_code", "title", "credits", "days", "start_time", "end_time", "instructor", "location"] if c in df.columns]
+            sample = df[sample_cols].head(18)
+            sample_html = sample.to_html(index=False, escape=False)
 
-        def _ensure_table(data: List[Dict[str, Any]], cols: List[str]) -> pd.DataFrame:
-            df = pd.DataFrame(data)
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = None
-            return df[cols]
+            deck_html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Columbia Course Finder — Demo Deck</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#111827; }}
+  .slide {{ width: 100%; height: 100vh; padding: 4rem 6vw; box-sizing: border-box; display:flex; flex-direction:column; justify-content:center; }}
+  h1,h2,h3 {{ margin: 0 0 0.75rem; }}
+  .muted {{ color:#6b7280; }}
+  .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; margin-top: 1rem; }}
+  .card {{ border:1px solid #e5e7eb; border-radius:8px; padding: 12px; background:#fafafa; }}
+  .table-wrap {{ max-height: 50vh; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; }}
+  footer {{ position: fixed; bottom: 10px; right: 16px; font-size: 12px; color:#9ca3af; }}
+</style>
+</head>
+<body>
 
-        table = _ensure_table(filtered, base_cols)
+<section class="slide">
+  <h1>Columbia Course Finder</h1>
+  <h3 class="muted">Term: {term_label}</h3>
+  <p>A scraping demo that discovers subjects, scrapes the Directory of Classes, links recitations to their parent lectures, and presents a student-friendly search UI.</p>
+</section>
 
-        if table.empty:
-            st.warning(
-                "No results for the current filters. "
-                "Tips: turn off points, change day, switch time mode to 'overlaps', "
-                "or pick a different time."
-            )
+<section class="slide">
+  <h2>Key metrics</h2>
+  <div class="kpis">
+    <div class="card"><strong>Sections</strong><div>{metrics["sections"]}</div></div>
+    <div class="card"><strong>Courses</strong><div>{metrics["courses"]}</div></div>
+    <div class="card"><strong>Subjects</strong><div>{metrics["subjects"]}</div></div>
+    <div class="card"><strong>Primaries</strong><div>{metrics["primaries"]}</div></div>
+    <div class="card"><strong>Recitations</strong><div>{metrics["recitations"]}</div></div>
+  </div>
+</section>
 
-        st.dataframe(table, use_container_width=True)
+<section class="slide">
+  <h2>Sample results</h2>
+  <div class="table-wrap">{sample_html}</div>
+</section>
 
-        # Download
-        st.download_button(
-            "Download results (JSON)",
-            data=json.dumps(filtered, ensure_ascii=False, indent=2),
-            file_name="results.json",
-            mime="application/json",
-        )
+<footer>Generated {datetime.utcnow().isoformat(timespec="seconds")}Z</footer>
+</body>
+</html>"""
+
+            os.makedirs("docs", exist_ok=True)
+            out_path = "docs/demo_deck.html"
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(deck_html)
+
+            st.download_button("🎞️ Download demo deck (HTML)", data=deck_html.encode("utf-8"),
+                               file_name="demo_deck.html", mime="text/html")
+            st.caption("Also written to **docs/demo_deck.html**")

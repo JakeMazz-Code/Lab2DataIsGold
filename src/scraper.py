@@ -1,411 +1,493 @@
 # src/scraper.py
 from __future__ import annotations
+
 import argparse
+import json
 import os
 import re
+import string
+import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+
 
 import requests
 from bs4 import BeautifulSoup
-from dateutil import parser as dtparser
-from tenacity import (
-    retry, stop_after_attempt, wait_exponential,
-    retry_if_exception
-)
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from validators import Course, Section, Meeting, Location, write_json
+# ---------------------------
+# Constants & basic utilities
+# ---------------------------
 
 BASE = "https://doc.sis.columbia.edu"
-UA = {"User-Agent": "ColumbiaCoursePOC/1.3 (+educational demo)"}
 
-# Conservative seed (remove invalid/fragile codes like EEBM).
-SUBJECTS_SEED = [
-    # Engineering / CS
-    "COMS", "CSEE", "ELEN", "BMEN", "MECE", "IEOR", "APMA",
-    # Core STEM
-    "MATH", "STAT", "PHYS", "CHEM", "BIOL",
-    # Social science / humanities (sample)
-    "ECON", "PSYC", "HIST", "PHIL", "ENGL", "SOCI", "HUMA"
-]
+TERM_SEMESTER_CODE = {"Spring": "1", "Summer": "2", "Fall": "3"}
 
-# ------------------- HTTP utils -------------------
+HEADERS = {
+    "User-Agent": "columbia-course-scraper/1.0 (+https://example.com; for demo/academic use)"
+}
 
-def polite_get(session: requests.Session, url: str, throttle: float = 1.0) -> requests.Response:
-    time.sleep(max(throttle, 0.0))
-    resp = session.get(url, headers=UA, timeout=30)
+RECITATION_SEC_RE = re.compile(r"^\s*R\d+\s*$", re.I)
+SECTION_DETAIL_PARENT_RE = re.compile(
+    r"Required\s+(?:recitation|discussion|lab)\s+session\s+for\s+students\s+enrolled\s+in\s+([A-Z]{3,4})\s+([A-Z]?\d{4})",
+    re.I,
+)
+
+DAY_MAP = {
+    "M": "Mon",
+    "T": "Tue",
+    "W": "Wed",
+    "R": "Thu",
+    "F": "Fri",
+    "S": "Sat",
+    "U": "Sun",
+}
+
+# ---------------------------------
+# Term normalization and conversions
+# ---------------------------------
+
+def normalize_term(term_str: str) -> str:
+    t = term_str.strip().replace(" ", "")
+    m = re.match(r"^(Spring|Summer|Fall)(\d{4})$", t)
+    if not m:
+        raise ValueError("Term must look like 'Fall2025' or 'Fall 2025'")
+    return f"{m.group(1)}{m.group(2)}"
+
+def term_to_sis_code(term_str: str) -> str:
+    m = re.match(r"^(Spring|Summer|Fall)\s?(\d{4})$", term_str.strip())
+    if not m:
+        m = re.match(r"^(Spring|Summer|Fall)(\d{4})$", term_str.replace(" ", ""))
+    semester, year = m.group(1), m.group(2)
+    return f"{year}{TERM_SEMESTER_CODE[semester]}"
+
+def term_human(term_str: str) -> str:
+    # "Fall2025" -> "Fall 2025"
+    t = normalize_term(term_str)
+    return f"{t[:-4]} {t[-4:]}"
+
+# -------------
+# HTTP helpers
+# -------------
+
+def polite_sleep(throttle: float):
+    if throttle and throttle > 0:
+        time.sleep(throttle)
+
+def polite_get(session: requests.Session, url: str, throttle: float = 0.4) -> requests.Response:
+    polite_sleep(throttle)
+    resp = session.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     return resp
 
-def _retry_on_exception(exc: BaseException) -> bool:
-    """
-    Tell tenacity when to retry:
-      - Retry on generic RequestException (timeouts, 5xx, etc.)
-      - DO NOT retry on 404 (subject not found for term).
-    """
-    if isinstance(exc, requests.HTTPError) and getattr(exc, "response", None) is not None:
-        if exc.response.status_code == 404:
-            return False
-    return isinstance(exc, requests.RequestException)
-
 @retry(
-    reraise=True,
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception(_retry_on_exception),
+    wait=wait_exponential(multiplier=0.8, min=0.5, max=8),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type((requests.RequestException,))
 )
-def fetch_text(session: requests.Session, url: str, throttle: float = 1.0) -> str:
+def fetch_text(session: requests.Session, url: str, throttle: float = 0.4) -> str:
     return polite_get(session, url, throttle).text
 
-def robots_allows(session: requests.Session, host_base: str, path: str) -> bool:
-    try:
-        r = session.get(urljoin(host_base, "/robots.txt"), headers=UA, timeout=15)
-        if r.status_code != 200:
-            return True
-        disallows = []
-        ua_all = False
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("user-agent"):
-                ua_all = "*" in line
-            if ua_all and line.lower().startswith("disallow:"):
-                disallows.append(line.split(":", 1)[1].strip())
-        for rule in disallows:
-            if not rule:
-                return True
-            if path.startswith(rule):
-                return False
-        return True
-    except Exception:
-        return True
+# -----------------------
+# Subject discovery (A–Z)
+# -----------------------
 
-# ------------------- Parsing helpers -------------------
+def discover_subjects_for_term(term: str, session: requests.Session, throttle: float = 0.4) -> List[Dict[str, str]]:
+    """
+    Scrape the A..Z subject index pages and collect the valid subject codes for the given term.
+    Returns: [{"code": "COMS", "name": "Computer Science"}, ...]
+    """
+    term_norm = normalize_term(term)  # "Fall2025"
+    subjects: Dict[str, str] = {}
 
-def _to_24h(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = s.strip()
-    if not s or s.upper() in {"TBA", "ARR"}:
-        return None
-    s = s.replace("Noon", "12:00 PM").replace("noon", "12:00 PM")
-    s = s.replace("Midnight", "12:00 AM").replace("midnight", "12:00 AM")
-    try:
-        t = dtparser.parse(s, fuzzy=True)
-        return t.strftime("%H:%M")
-    except Exception:
-        if s.endswith("a") or s.endswith("p"):
-            try:
-                t = dtparser.parse(s + "m", fuzzy=True)
-                return t.strftime("%H:%M")
-            except Exception:
-                return None
-        return None
+    for letter in string.ascii_uppercase:
+        url = f"{BASE}/sel/subj-{letter}.html"  # e.g., https://doc.sis.columbia.edu/sel/subj-A.html
+        html = fetch_text(session, url, throttle)
+        soup = BeautifulSoup(html, "html.parser")
 
-def _days_compact_to_tokens(s: str) -> List[str]:
-    s = (s or "").strip().upper()
+        # On each line: <Subject Name>  [Summer2025] [Fall2025] ...
+        # We need anchors whose text equals term_norm; their hrefs point to /subj/<CODE>/_Fall2025.html
+        for a in soup.find_all("a"):
+            if (a.get_text(strip=True) or "") == term_norm:
+                href = a.get("href") or ""
+                m = re.search(r"/subj/([A-Z0-9_]+)/_", href)
+                if not m:
+                    continue
+                code = m.group(1)
+                # Subject name is in parent text ("Applied Mathematics Summer2025, Fall2025")
+                parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
+                # Strip trailing term tokens
+                name = re.split(r"\b(Spring|Summer|Fall)\d{4}", parent_text)[0].strip(" ,:\u00A0")
+                subjects[code] = name if name else code
+
+    return [{"code": c, "name": subjects[c]} for c in sorted(subjects.keys())]
+
+def save_subjects_file(path: str, term: str, subjects: List[Dict[str, str]]) -> None:
+    payload = {
+        "term": normalize_term(term),
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "subjects": subjects,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def load_subject_codes_from_file(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        js = json.load(f)
+    return [s["code"] for s in js.get("subjects", [])]
+
+# -------------------------------------------
+# Parsing the subject "plain text" list page
+# -------------------------------------------
+
+def _detect_columns(header_line: str) -> Dict[str, slice]:
+    """
+    Build fixed-width slices from the header row in the plain-text page.
+    Header example (from DOC):
+        Number Sec  Call#      Pts  Title                           Day Time          Room Building        Faculty
+    """
+    def col_pos(name: str) -> int:
+        idx = header_line.find(name)
+        if idx < 0:
+            raise ValueError(f"Column '{name}' not found in header.")
+        return idx
+
+    # Get start indices
+    starts = {
+        "Number": col_pos("Number"),
+        "Sec": col_pos("Sec"),
+        "Call#": col_pos("Call#"),
+        "Pts": col_pos("Pts"),
+        "Title": col_pos("Title"),
+        "Day": col_pos("Day"),
+        "Time": col_pos("Time"),
+        "Room": col_pos("Room"),
+        "Building": col_pos("Building"),
+        "Faculty": col_pos("Faculty"),
+    }
+    # Compute slices by next column start
+    keys = ["Number", "Sec", "Call#", "Pts", "Title", "Day", "Time", "Room", "Building", "Faculty"]
+    slices: Dict[str, slice] = {}
+    for i, k in enumerate(keys):
+        start = starts[k]
+        end = len(header_line) if i == len(keys) - 1 else starts[keys[i + 1]]
+        slices[k] = slice(start, end)
+    return slices
+
+def _parse_time_range(time_str: str) -> Tuple[Optional[str], Optional[str]]:
+    # "8:40am-9:55am" -> ("08:40", "09:55")
+    s = time_str.strip()
+    if not s or s.lower() == "tba":
+        return (None, None)
+    m = re.match(r"(\d{1,2}:\d{2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)", s, flags=re.I)
+    if not m:
+        return (None, None)
+    def to_24h(x: str) -> str:
+        x = x.strip().lower()
+        am = x.endswith("am")
+        pm = x.endswith("pm")
+        x = x[:-2].strip()
+        hh, mm = [int(t) for t in x.split(":")]
+        if pm and hh != 12:
+            hh += 12
+        if am and hh == 12:
+            hh = 0
+        return f"{hh:02d}:{mm:02d}"
+    return (to_24h(m.group(1)), to_24h(m.group(2)))
+
+def _credits_to_range(pts: str) -> Tuple[Optional[float], Optional[float]]:
+    s = (pts or "").strip()
     if not s:
+        return (None, None)
+    if "-" in s:
+        a, b = s.split("-", 1)
+        try:
+            return (float(a), float(b))
+        except ValueError:
+            return (None, None)
+    try:
+        v = float(s)
+        return (v, v)
+    except ValueError:
+        return (None, None)
+
+def _split_days(day_field: str) -> List[str]:
+    s = (day_field or "").strip().upper()
+    # Single letters with possible spaces; combine e.g. "TR" or "MW".
+    s = re.sub(r"\s+", "", s)
+    return [DAY_MAP[d] for d in s if d in DAY_MAP]
+
+def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) -> List[Dict]:
+    """
+    Given the _Fall2025_text.html content, parse into a list of section dicts.
+    """
+    # Extract the PRE-ish block (page is text wrapped in <pre> or monospaced <div>)
+    soup = BeautifulSoup(text_html, "html.parser")
+    raw = soup.get_text("\n", strip=False)
+
+    lines = [ln.rstrip("\n") for ln in raw.splitlines()]
+    # Find header line (has "Number Sec  Call#")
+    header_idx = -1
+    for i, ln in enumerate(lines):
+        if "Number" in ln and "Call#" in ln and "Faculty" in ln:
+            header_idx = i
+            break
+    if header_idx < 0:
         return []
-    mapping = {"M": "M", "T": "Tu", "W": "W", "R": "Th", "F": "F", "S": "Sa", "U": "Su"}
-    out: List[str] = []
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        nxt = s[i + 1] if i + 1 < len(s) else ""
-        if ch == "T" and nxt == "H":
-            out.append("Th")
-            i += 2
-            continue
-        if ch == "T" and nxt == "U":
-            out.append("Tu")
-            i += 2
-            continue
-        out.append(mapping.get(ch, None) or "")
+
+    header = lines[header_idx]
+    slices = _detect_columns(header)
+
+    sections: List[Dict] = []
+
+    i = header_idx + 1
+    while i < len(lines):
+        ln = lines[i]
         i += 1
-    seen = set()
-    dedup = []
-    for d in out:
-        if d and d not in seen:
-            seen.add(d)
-            dedup.append(d)
-    return dedup
+        # Skip empty or "L Code" etc footers
+        if not ln.strip():
+            continue
+        if re.search(r"\bL\s+Code\b", ln):
+            break
 
-# ------------------- Columbia DOC Scraper -------------------
+        # Rows that contain a Number (course number) live in this line
+        number = ln[slices["Number"]].strip()
+        sec = ln[slices["Sec"]].strip()
+        calln = ln[slices["Call#"]].strip()
+        pts = ln[slices["Pts"]].strip()
+        title = ln[slices["Title"]].strip()
+        day = ln[slices["Day"]].strip()
+        time_rng = ln[slices["Time"]].strip()
+        room = ln[slices["Room"]].strip()
+        building = ln[slices["Building"]].strip()
+        faculty = ln[slices["Faculty"]].strip()
 
-class ColumbiaDOCScraper:
+        # Some rows are continuation or notes lines (no Number/Sec), skip those here
+        if not number and not sec and not title and not day and not time_rng and not faculty:
+            continue
+
+        # Normalize values
+        start_time, end_time = _parse_time_range(time_rng)
+        credits_min, credits_max = _credits_to_range(pts)
+
+        # Peek next line for "Activity" (e.g., LECTURE/SEMINAR/LAB) if present
+        component = None
+        if i < len(lines):
+            nxt = lines[i]
+            if re.search(r"\bActivity\b", nxt) or re.search(r"\bLECTURE\b|\bSEMINAR\b|\bLAB\b|\bRECITATION\b", nxt, re.I):
+                # Extract activity token if present
+                m = re.search(r"\b(LECTURE|SEMINAR|LAB|RECITATION|INDEPEND|PRACTICUM|WORKSHOP|STUDIO)\b", nxt, re.I)
+                if m:
+                    component = m.group(1).upper()
+                i += 1  # consume this extra line
+
+        # Build the section record
+        sections.append({
+            "university": "Columbia University",
+            "term": term_label,                       # e.g., "Fall 2025"
+            "subject": subject_code,                  # e.g., "COMS"
+            "number": number,                         # e.g., "W4701"
+            "course_code": f"{subject_code} {number}",# e.g., "COMS W4701"
+            "section": sec,                           # e.g., "001" or "R01"
+            "crn": calln,                             # call number
+            "title": title,
+            "credits_min": credits_min,
+            "credits_max": credits_max,
+            "credits": credits_min if credits_min == credits_max else None,  # convenient single value if fixed
+            "days": _split_days(day),
+            "start_time": start_time,
+            "end_time": end_time,
+            "location": {
+                "building": building or None,
+                "room": room or None,
+                "campus": None,
+            },
+            "instructor": faculty or None,
+            "component": component,  # may be None; recitation detection also uses section code & credits
+            "is_recitation": bool(RECITATION_SEC_RE.match(sec)) or (component == "RECITATION" and (credits_min == 0 or credits_min is None)),
+            "parent_course_code": None,              # to be filled by linker if we can find it
+            "detail_url": None,                      # to be filled later
+            "short_desc": None,                      # optional enrichment
+            "status": None,                          # optional enrichment
+        })
+
+    return sections
+
+# -------------------------
+# Detail page URL + linking
+# -------------------------
+
+def build_section_detail_url(subject: str, number: str, term_code: str, section: str) -> str:
+    # e.g., /subj/APMA/E2001-20253-R01/
+    return f"{BASE}/subj/{subject}/{number}-{term_code}-{section}/"
+
+def try_link_recitation_parent(session: requests.Session, subj: str, number: str, sec: str, term_code: str, throttle: float = 0.35) -> Optional[str]:
+    url = build_section_detail_url(subj, number, term_code, sec)
+    try:
+        html = fetch_text(session, url, throttle)
+    except Exception:
+        return None
+    m = SECTION_DETAIL_PARENT_RE.search(html)
+    if m:
+        parent_subj, parent_num = m.group(1).upper(), m.group(2).upper()
+        return f"{parent_subj} {parent_num}"
+    return None
+
+def link_recitations(sections: List[Dict], term_code: str, session: requests.Session) -> List[Dict]:
     """
-    Scrapes Columbia Directory of Classes using static endpoints:
-      - Subject HTML: /subj/{SUBJ}/_{TERM}.html           (for detail links)
-      - Subject TEXT: /subj/{SUBJ}/_{TERM}_text.html      (for robust rows)
+    For sections flagged as recitations (R## or "RECITATION"/0 credits), try to find their parent lecture.
+    Strategy:
+      1) Strong: parse the section detail page (often states 'Required recitation session for ...').
+      2) Fallback: find nearest lecture with matching subject + (normalized) title and credits>0.
     """
+    def norm(s: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-    def __init__(self, term_label: str, subjects: Optional[List[str]] = None,
-                 throttle: float = 1.0, enrich_descriptions: bool = True):
-        self.term_label = self._normalize_term(term_label)  # "Fall2025"
-        self.subjects = [s.strip().upper() for s in (subjects or []) if s.strip()]
-        self.throttle = throttle
-        self.enrich_descriptions = enrich_descriptions
-        self.session = requests.Session()
+    # Index candidate lectures by (subject, title_norm) -> set(course codes)
+    lecture_index: Dict[Tuple[str, str], List[str]] = {}
+    for s in sections:
+        if not s.get("is_recitation"):
+            # Consider "lecture-like" primary comps: credits>0 OR component indicates lecture/seminar
+            if (s.get("credits_min") or 0) > 0 or (s.get("component") in ("LECTURE", "SEMINAR", "WORKSHOP", "STUDIO")):
+                key = (s["subject"], norm(s["title"]))
+                lecture_index.setdefault(key, [])
+                cc = s["course_code"]
+                if cc not in lecture_index[key]:
+                    lecture_index[key].append(cc)
 
-    @staticmethod
-    def _normalize_term(term_label: str) -> str:
-        s = term_label.replace(" ", "")
-        if not re.match(r"^(Fall|Spring|Summer)\d{4}$", s):
-            raise ValueError(f"Bad term: {term_label}")
-        return s
+    for s in sections:
+        if not s.get("is_recitation"):
+            continue
+        subj, number, sec = s["subject"], s["number"], s["section"]
+        # Fill detail URL always; helpful for UI
+        s["detail_url"] = build_section_detail_url(subj, number, term_code, sec)
 
-    @staticmethod
-    def _term_human(term_label: str) -> str:
-        return f"{term_label[:-4]} {term_label[-4:]}"
+        # Strong link via detail page
+        parent = try_link_recitation_parent(session, subj, number, sec, term_code)
+        if not parent:
+            # Fallback: title match within the same subject
+            key = (subj, norm(s["title"]))
+            candidates = lecture_index.get(key, [])
+            parent = candidates[0] if candidates else None
+        if parent:
+            s["parent_course_code"] = parent
 
-    def _subj_html_url(self, subject: str) -> str:
-        return f"{BASE}/subj/{subject}/_{self.term_label}.html"
+    # Also attach detail_url for non-recitation sections (handy for "Open in DOC")
+    for s in sections:
+        if not s.get("detail_url"):
+            s["detail_url"] = build_section_detail_url(s["subject"], s["number"], term_code, s["section"])
 
-    def _subj_text_url(self, subject: str) -> str:
-        return f"{BASE}/subj/{subject}/_{self.term_label}_text.html"
+    return sections
 
-    def _map_section_links(self, html: str, subject: str) -> Dict[Tuple[str, str], str]:
-        soup = BeautifulSoup(html, "lxml")
-        mapping: Dict[Tuple[str, str], str] = {}
-        anchors = soup.find_all("a")
-        # e.g., /subj/MECE/E3100-20243-001/
-        href_pat = re.compile(rf"/subj/{re.escape(subject)}/([A-Z]{{1,3}}\d{{3,4}})-(\d+)-([A-Za-z0-9]+)/")
-        for a in anchors:
-            href = a.get("href") or ""
-            m = href_pat.search(href)
-            if m:
-                number, section = m.group(1), m.group(3)
-                mapping[(number, section)] = urljoin(BASE, href)
-        return mapping
+# ----------------
+# Top-level scrape
+# ----------------
 
-    def _fetch_section_meta(self, url: str) -> Dict[str, Optional[str]]:
-        """
-        Returns {'description': str|None, 'component': str|None}
-        Parses 'Course Description' and 'Type | Lecture/Recitation/Lab/...'
-        """
-        html = fetch_text(self.session, url, throttle=self.throttle)
-        soup = BeautifulSoup(html, "lxml")
-        text = soup.get_text("\n", strip=True)
+def scrape_subject(subject_code: str, term: str, session: requests.Session, throttle: float = 0.4) -> List[Dict]:
+    """
+    Scrape one subject for the given term using the plain-text page:
+        https://doc.sis.columbia.edu/subj/<SUBJECT>/_<TERM>.html
+        https://doc.sis.columbia.edu/subj/<SUBJECT>/_<TERM>_text.html
+    """
+    term_norm = normalize_term(term)   # Fall2025
+    term_code = term_to_sis_code(term) # e.g., 20253
+    term_label = term_human(term)      # e.g., "Fall 2025"
 
-        # Description
-        desc = None
-        m = re.search(r"Course Description\s*(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            desc = m.group(1).strip()
-            desc = re.split(
-                r"(Web Site|Department|Enrollment|Subject|Number|Section|Division|Method of Instruction|Type)\s*\|",
-                desc, maxsplit=1
-            )[0]
-            desc = re.sub(r"\s+", " ", desc).strip()
-            if desc:
-                desc = desc[:1000]
+    # 1) Ensure the term-subject page exists (for status & "plain text version" link)
+    subj_url = f"{BASE}/subj/{subject_code}/_{term_norm}.html"
+    html = fetch_text(session, subj_url, throttle)
 
-        # Component Type
-        comp = None
-        m2 = re.search(r"Type\s*\|\s*([A-Za-z /-]+)", text, flags=re.IGNORECASE)
-        if m2:
-            comp = m2.group(1).strip().title()
+    # 2) Get the "plain text version"
+    soup = BeautifulSoup(html, "html.parser")
+    text_link = None
+    for a in soup.find_all("a"):
+        if "plain text version" in (a.get_text(strip=True) or "").lower():
+            text_link = (a.get("href") or "").strip()
+            break
+    if not text_link:
+        # Fallback: known shape (absolute-from-root path)
+        text_link = f"/subj/{subject_code}/_{term_norm}_text.html"
 
-        return {"description": desc, "component": comp}
+    # Use urljoin to resolve any relative (e.g., "../subj/...") hrefs safely
+    text_url = urljoin(f"{BASE}/", (text_link or "").strip())
+    # Alternatively: urljoin(subj_url, text_link) also works; using BASE+'/' is fine too.
 
-    def _parse_subject_text(self, text: str, subject: str) -> List[Dict[str, Any]]:
-        """
-        Parse the plain-text listing into records:
-        Columns: Number Sec Call# Pts Title Day Time Room Building Faculty
-        """
-        rows: List[Dict[str, Any]] = []
-        pat = re.compile(
-            r"^\s*(?P<number>[A-Z]{1,3}\d{3,4})\s+"
-            r"(?P<section>[A-Za-z0-9]{1,3})\s+"
-            r"(?P<call>\d{3,6})\s+"
-            r"(?P<pts>\d+(?:\.\d+)?)\s+"
-            r"(?P<title>.+?)\s{2,}"
-            r"(?P<days>[MTWRFSU]{1,7})\s+"
-            r"(?P<start>\d{1,2}:\d{2}(?:\s*[ap]m?)?)"
-            r"(?:\s*-\s*(?P<end>\d{1,2}:\d{2}(?:\s*[ap]m?)?))?"
-            r"\s+(?P<room_building>.+?)\s{2,}"
-            r"(?P<faculty>.+?)\s*$"
-        )
-        for line in text.splitlines():
-            if not line or "Number Sec  Call#" in line:
-                continue
-            m = pat.match(line)
-            if not m:
-                continue
-            gd = m.groupdict()
-            rows.append({
-                "subject": subject,
-                "number": gd["number"],
-                "section": gd["section"],
-                "crn": gd["call"],
-                "points": gd["pts"],
-                "title": re.sub(r"\s+", " ", gd["title"]).strip(),
-                "days_tokens": _days_compact_to_tokens(gd["days"]),
-                "start_24": _to_24h(gd["start"]),
-                "end_24": _to_24h(gd.get("end")),
-                "room_building": re.sub(r"\s+", " ", gd["room_building"]).strip(),
-                "instructor": re.sub(r"\s+", " ", gd["faculty"]).strip(),
-            })
-        return rows
+    text_html = fetch_text(session, text_url, throttle)
 
-    # -------------- Public entry --------------
+    # 3) Parse sections
+    sections = parse_subject_text_page(text_html, subject_code, term_label)
+    # 4) Link recitations → lectures; attach detail URLs
+    sections = link_recitations(sections, term_code, session)
+    return sections
 
-    def scrape_subject(self, subject: str) -> List[Course]:
-        """
-        Scrape a single subject:
-          * Fetch TEXT first (authoritative rows). If TEXT is 404 -> skip subject.
-          * Try HTML (optional); if 404, just skip enrichment/link mapping.
-        """
-        # TEXT first
+def scrape_many(subject_codes: List[str], term: str, session: requests.Session, throttle: float = 0.4) -> List[Dict]:
+    all_sections: List[Dict] = []
+    for code in subject_codes:
         try:
-            text = fetch_text(self.session, self._subj_text_url(subject), throttle=self.throttle)
+            secs = scrape_subject(code, term, session, throttle)
+            all_sections.extend(secs)
         except requests.HTTPError as e:
+            # Non-offered subjects for the term often 404; skip gracefully
             if e.response is not None and e.response.status_code == 404:
-                print(f"[skip] {subject} {self.term_label}: 404 (no TEXT listing)")
-                return []
+                print(f"[warn] {code}: no listing for {term_human(term)}")
+                continue
             raise
+    return all_sections
 
-        raw_rows = self._parse_subject_text(text, subject)
+def write_json(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-        # Try HTML for detail links (optional)
-        link_map: Dict[Tuple[str, str], str] = {}
-        try:
-            html = fetch_text(self.session, self._subj_html_url(subject), throttle=self.throttle)
-            link_map = self._map_section_links(html, subject)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                # No HTML index — proceed without enrichment.
-                link_map = {}
-            else:
-                raise
-
-        courses_by_key: Dict[Tuple[str, str], Course] = {}
-        for r in raw_rows:
-            key = (subject, r["number"])
-            course = courses_by_key.get(key)
-            if not course:
-                course = Course(
-                    university="Columbia University",
-                    subject=subject,
-                    number=r["number"],
-                    course_code=f"{subject} {r['number']}",
-                    title=r["title"],
-                    credits=r["points"],
-                    description=None,
-                    prerequisites=None,
-                    sections=[],
-                )
-                courses_by_key[key] = course
-
-            # Location split
-            building = room = None
-            tokens = r["room_building"].split()
-            if tokens and re.match(r"^\d+[A-Z]?$", tokens[0]):  # e.g., 417, 451, 301M
-                room = tokens[0]
-                building = " ".join(tokens[1:]) if len(tokens) > 1 else None
-            else:
-                building = r["room_building"]
-
-            # Optional description + component enrichment (only if we have a link)
-            desc, comp = None, None
-            if self.enrich_descriptions and not course.description:
-                detail_url = link_map.get((r["number"], r["section"]))
-                if detail_url:
-                    try:
-                        meta = self._fetch_section_meta(detail_url)
-                        desc = meta.get("description")
-                        comp = meta.get("component")
-                        if desc:
-                            course.description = desc
-                    except Exception:
-                        pass
-
-            # Fallback heuristic for component if not found
-            if not comp:
-                comp = ("Recitation" if (str(course.credits).strip() in {"0", "0.0"} or "RECIT" in course.title.upper())
-                        else None)
-
-            mtg = Meeting(
-                days=r["days_tokens"],
-                start_time=r["start_24"],
-                end_time=r["end_24"],
-                time_tba=False if (r["start_24"] or r["end_24"]) else True,
-                location=Location(building=building, room=room),
-            )
-            sec = Section(
-                term=self._term_human(self.term_label),
-                crn=r["crn"],
-                section=r["section"],
-                instructor=r["instructor"],
-                status=None,
-                component=comp,
-                meetings=[mtg],
-            )
-            course.sections.append(sec)
-
-        return list(courses_by_key.values())
-
-    def scrape(self) -> List[Course]:
-        if not robots_allows(self.session, BASE, "/"):
-            raise RuntimeError("robots.txt disallows scraping this path.")
-        all_courses: List[Course] = []
-        for subj in self.subjects:
-            try:
-                courses = self.scrape_subject(subj)
-                all_courses.extend(courses)
-            except requests.HTTPError as e:
-                # Should be rare now; TEXT 404 is handled inside scrape_subject.
-                code = e.response.status_code if e.response is not None else "?"
-                print(f"[warn] {subj} {self.term_label}: HTTP {code}; continuing.")
-                continue
-            except Exception as e:
-                print(f"[warn] {subj} {self.term_label}: {e}; continuing.")
-                continue
-        return all_courses
-
-    # ------------ Subject discovery (seeded "ALL") ------------
-
-    @staticmethod
-    def load_subjects_seed(seed_path: Optional[str] = None) -> List[str]:
-        # If a file is provided and exists, use it; else fall back to SUBJECTS_SEED.
-        if seed_path and os.path.exists(seed_path):
-            with open(seed_path, "r", encoding="utf-8") as f:
-                items = [ln.strip().upper() for ln in f if ln.strip()]
-            return items
-        return SUBJECTS_SEED[:]
-
-# ------------------- CLI -------------------
+# -----------------------------
+# CLI (useful for quick testing)
+# -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Scrape Columbia DOC by subject and term.")
-    ap.add_argument("--term", required=True, help='e.g., "Fall2025" or "Fall 2025"')
-    ap.add_argument("--subjects", help="Comma-separated subject codes, e.g., COMS,STAT,ECON")
-    ap.add_argument("--all", action="store_true", help="Scrape all (seeded) subjects for this term")
-    ap.add_argument("--subjects-file", default=None, help="Path to a file with one subject code per line")
-    ap.add_argument("--out", default="data/sample_output.json")
-    ap.add_argument("--throttle", type=float, default=1.0)
-    ap.add_argument("--no-desc", action="store_true", help="Skip per-section description/component enrichment")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Columbia DOC scraper")
+    parser.add_argument("--term", default="Fall 2025", help="e.g., 'Fall 2025' or 'Fall2025'")
+    parser.add_argument("--discover-subjects", action="store_true", help="Discover all valid subjects for the term.")
+    parser.add_argument("--save-subjects", default=None, help="Path to save discovered subjects JSON (e.g., data/subjects_Fall2025.json).")
+    parser.add_argument("--subjects-file", default=None, help="Path to subjects JSON from discovery.")
+    parser.add_argument("--subjects", nargs="*", default=None, help="Explicit subject codes to scrape (overrides subjects-file).")
+    parser.add_argument("--scrape", action="store_true", help="After discovery, scrape subjects.")
+    parser.add_argument("--max-subjects", type=int, default=None, help="Optional cap when scraping many subjects.")
+    parser.add_argument("--out", default="data/sample_output.json", help="Where to write scraped JSON.")
+    args = parser.parse_args()
 
-    if not args.all and not args.subjects:
-        ap.error("Provide --subjects or use --all (optionally with --subjects-file).")
+    session = requests.Session()
 
-    if args.all:
-        subjects = ColumbiaDOCScraper.load_subjects_seed(args.subjects_file)
+    subjects_to_scrape: List[str] = []
+    discovered = None
+
+    if args.subjects:
+        subjects_to_scrape = args.subjects
+    elif args.subjects_file:
+        subjects_to_scrape = load_subject_codes_from_file(args.subjects_file)
     else:
-        subjects = [s.strip() for s in args.subjects.split(",") if s.strip()]
+        # Auto-discover
+        discovered = discover_subjects_for_term(args.term, session)
+        if args.save_subjects:
+            save_subjects_file(args.save_subjects, args.term, discovered)
+            print(f"[info] wrote {len(discovered)} subjects to {args.save_subjects}")
+        subjects_to_scrape = [s["code"] for s in discovered]
 
-    scraper = ColumbiaDOCScraper(
-        term_label=args.term,
-        subjects=subjects,
-        throttle=args.throttle,
-        enrich_descriptions=not args.no_desc
-    )
-    courses = scraper.scrape()
-    write_json(args.out, courses)
-    print(f"Wrote {len(courses)} courses across {len(subjects)} subjects to {args.out}")
+    if args.max_subjects:
+        subjects_to_scrape = subjects_to_scrape[: args.max_subjects]
+
+    if args.discover-subjects and not args.scrape:
+        return 0
+
+    if args.scrape:
+        sections = scrape_many(subjects_to_scrape, args.term, session)
+        write_json(args.out, sections)
+        print(f"[ok] wrote {len(sections)} sections to {args.out}")
+
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
