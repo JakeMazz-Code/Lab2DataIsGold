@@ -1,7 +1,10 @@
-# Python dependencies
-# Web scraping and automation packages
-selenium==4.15.2
-beautifulsoup4==4.12.2
-requests==2.31.0
-lxml==4.9.3
-webdriver-manager==4.0.1
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+lxml>=5.2,<6
+tenacity>=9.0,<10
+pydantic>=1.10,<2
+python-dateutil>=2.9,<3
+pandas>=2.2,<3
+streamlit>=1.36,<2
+# Optional, only if you use --selenium
+selenium>=4.22,<5
