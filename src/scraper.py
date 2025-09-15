@@ -8,6 +8,7 @@ import re
 import string
 import sys
 import time
+import unicodedata
 from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -45,6 +46,8 @@ DAY_MAP = {
     "S": "Sat",
     "U": "Sun",
 }
+
+_TIME_SEP_RE = re.compile(r"\s*(?:-|–|—|‒|to)\s*", re.I)
 
 # ---------------------------------
 # Term normalization and conversions
@@ -178,116 +181,142 @@ def _detect_columns(header_line: str) -> Dict[str, slice]:
         slices[k] = slice(start, end)
     return slices
 
-def _parse_time_range(time_str: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Robust parser for Columbia DOC time strings.
-    Accepts:
-      - "1:10 pm-2:25 pm", "1:10pm - 2:25pm", "1:10 PM — 2:25 PM", "1:10 pm to 2:25 pm"
-      - Numeric: "1410-1525", "900-1025"
-      - Single time: "1:10 pm", "1410"  -> duplicate to both
-      - "TBA" -> (None, None)
-
-    Returns 24h labels ("HH:MM") or (None, None).
-    """
-    s_orig = (time_str or "").strip()
-    if not s_orig:
-        return (None, None)
-
-    s = s_orig
-    # Normalize unicode dashes, A.M./P.M., whitespace, "to"
+def _normalize_dashes(s: str) -> str:
+    if not s:
+        return ""
     s = s.replace("\u00A0", " ")
-    s = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", s)  # all dash-like → "-"
-    s = re.sub(r"\bto\b", "-", s, flags=re.I)
-    s = re.sub(r"\.", "", s)  # a.m. -> am
-    s = re.sub(r"\s+", " ", s).strip()
+    for ch in ["\u2013", "\u2014", "\u2015", "\u2012", "\u2212", "\u2011"]:
+        s = s.replace(ch, "-")
+    return " ".join(s.split())
 
-    if re.search(r"\bTBA\b", s, flags=re.I):
-        return (None, None)
+def _to_24h(hh: int, mm: int, ampm: Optional[str]) -> str:
+    if ampm:
+        a = ampm.lower()
+        if a.startswith("p") and hh != 12:
+            hh += 12
+        if a.startswith("a") and hh == 12:
+            hh = 0
+    return f"{hh:02d}:{mm:02d}"
 
-    def ampm_parts(tok: str) -> Tuple[int, int, Optional[str]]:
-        m = re.search(r"^\s*(\d{1,2}):(\d{2})\s*([ap]m)?\s*$", tok, flags=re.I)
-        if not m:
-            return (-1, -1, None)
-        hh, mm = int(m.group(1)), int(m.group(2))
-        ap = (m.group(3) or "").lower() if m.group(3) else None
-        return hh, mm, ap
-
-    def to_24h(h: int, m: int, ap: Optional[str]) -> Optional[str]:
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            return None
-        if ap:
-            if ap == "pm" and h != 12:
-                h += 12
-            if ap == "am" and h == 12:
-                h = 0
-        return f"{h:02d}:{m:02d}"
-
-    def hhmm_token(tok: str) -> Optional[str]:
-        tok = tok.strip()
-        m = re.match(r"^(\d{3,4})$", tok)
-        if not m:
-            return None
-        val = m.group(1)
-        if len(val) == 3:
-            h = int(val[0])
-            mm = int(val[1:])
-        else:
-            h = int(val[:2])
-            mm = int(val[2:])
-        if 0 <= h <= 23 and 0 <= mm <= 59:
-            return f"{h:02d}:{mm:02d}"
+def _parse_hhmm_digits(token: str) -> Optional[str]:
+    t = token.strip()
+    if not re.fullmatch(r"\d{3,4}", t):
         return None
+    hh = int(t[:-2])
+    mm = int(t[-2:])
+    if 0 <= hh <= 23 and 0 <= mm < 60:
+        return f"{hh:02d}:{mm:02d}"
+    return None
 
-    # 1) AM/PM range (allow missing am/pm on one side; infer from the other)
-    m = re.search(r"(\d{1,2}:\d{2}\s*(?:[ap]m)?)\s*-\s*(\d{1,2}:\d{2}\s*(?:[ap]m)?)", s, flags=re.I)
+def parse_time_label(s: str) -> Tuple[Optional[int], str]:
+    """
+    Accepts: 1410, 900, 09:00, 1:10 PM, TBA
+    Returns: (HHMM int | None, 'HH:MM' | 'TBA')
+    """
+    if not s or s.strip().lower() in {"tba", "tbd"}:
+        return (None, "TBA")
+
+    t = _normalize_dashes(s).strip().lower().replace(".", "")
+
+    # AM/PM form
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*([ap]m)", t)
     if m:
-        a_raw, b_raw = m.group(1), m.group(2)
-        ah, am, aap = ampm_parts(a_raw)
-        bh, bm, bap = ampm_parts(b_raw)
-        if not aap and bap:
-            aap = bap
-        if not bap and aap:
-            bap = aap
-        a24 = to_24h(ah, am, aap)
-        b24 = to_24h(bh, bm, bap)
-        if a24 and b24:
-            # If inferred same meridiem yields end <= start, flip end once
-            ah24, am24 = map(int, a24.split(":"))
-            bh24, bm24 = map(int, b24.split(":"))
-            if (bh24 * 60 + bm24) <= (ah24 * 60 + am24) and (bap is None) and (aap in {"am", "pm"}):
-                flip = "pm" if aap == "am" else "am"
-                b24_alt = to_24h(bh, bm, flip)
-                if b24_alt:
-                    b24 = b24_alt
-            return (a24, b24)
+        hh, mm, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+        lab = _to_24h(hh, mm, ap)
+        return (int(lab.replace(":", "")), lab)
 
-    # 2) HHMM numeric range
-    m = re.search(r"\b(\d{3,4})\s*-\s*(\d{3,4})\b", s)
+    # 24h HH:MM
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
     if m:
-        a = hhmm_token(m.group(1))
-        b = hhmm_token(m.group(2))
-        if a and b:
-            ah, am = map(int, a.split(":"))
-            bh, bm = map(int, b.split(":"))
-            if (bh * 60 + bm) > (ah * 60 + am):
-                return (a, b)
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm < 60:
+            lab = f"{hh:02d}:{mm:02d}"
+            return (int(lab.replace(":", "")), lab)
 
-    # 3) Single AM/PM → duplicate
-    m = re.search(r"\b(\d{1,2}:\d{2}\s*(?:[ap]m))\b", s, flags=re.I)
+    # HHMM digits
+    lab = _parse_hhmm_digits(t)
+    if lab:
+        return (int(lab.replace(":", "")), lab)
+
+    return (None, "TBA")
+
+def parse_timerange_any(s: str) -> Tuple[Tuple[Optional[int], str], Tuple[Optional[int], str]]:
+    """
+    Normalize unicode dashes → '-', accept 'to' as a separator.
+    Try in order:
+      1) AM/PM range (AM/PM may appear on one or both sides; propagate if only one side has it)
+      2) 24h HH:MM range
+      3) HHMM digits range
+      4) Single time (AM/PM or HH:MM or HHMM) → duplicate to both
+      5) TBA/TBD
+    Return ((start_int|None, start_label), (end_int|None, end_label)).
+    """
+    s_norm = _normalize_dashes(s).lower().replace(".", "")
+
+    if not s_norm or s_norm in {"tba", "tbd"}:
+        return ((None, "TBA"), (None, "TBA"))
+
+    # 1) AM/PM range
+    m = re.search(
+        r"(\d{1,2}):(\d{2})\s*([ap]m)?\s*(?:-|to)\s*(\d{1,2}):(\d{2})\s*([ap]m)?",
+        s_norm, re.I
+    )
     if m:
-        h, m_, ap = ampm_parts(m.group(1))
-        t = to_24h(h, m_, ap)
-        if t:
-            return (t, t)
+        h1, m1, a1 = int(m.group(1)), int(m.group(2)), (m.group(3) or "").lower()
+        h2, m2, a2 = int(m.group(4)), int(m.group(5)), (m.group(6) or "").lower()
+        if not a1 and a2: a1 = a2
+        if not a2 and a1: a2 = a1
+        lab1 = _to_24h(h1, m1, a1 if a1 else None)
+        lab2 = _to_24h(h2, m2, a2 if a2 else None)
+        i1, i2 = int(lab1.replace(":", "")), int(lab2.replace(":", ""))
+        if i2 > i1:
+            return ((i1, lab1), (i2, lab2))
 
-    # 4) Single HHMM → duplicate
-    m = re.search(r"\b(\d{3,4})\b", s)
+    # 2) 24h range
+    m = re.search(r"\b(\d{1,2}):(\d{2})\s*(?:-|to)\s*(\d{1,2}):(\d{2})\b", s_norm)
     if m:
-        t = hhmm_token(m.group(1))
-        if t:
-            return (t, t)
+        h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if (0 <= h1 <= 23 and 0 <= m1 < 60 and 0 <= h2 <= 23 and 0 <= m2 < 60):
+            lab1 = f"{h1:02d}:{m1:02d}"
+            lab2 = f"{h2:02d}:{m2:02d}"
+            i1, i2 = int(lab1.replace(":", "")), int(lab2.replace(":", ""))
+            if i2 > i1:
+                return ((i1, lab1), (i2, lab2))
 
-    return (None, None)
+    # 3) HHMM digits range
+    m = re.search(r"\b(\d{3,4})\s*(?:-|to)\s*(\d{3,4})\b", s_norm)
+    if m:
+        l1 = _parse_hhmm_digits(m.group(1))
+        l2 = _parse_hhmm_digits(m.group(2))
+        if l1 and l2:
+            i1, i2 = int(l1.replace(":", "")), int(l2.replace(":", ""))
+            if i2 > i1:
+                return ((i1, l1), (i2, l2))
+
+    # 4) Single time (duplicate) — guard against TBA and invalids
+    m = re.search(r"\b(\d{1,2}:\d{2}\s*[ap]m)\b", s_norm, re.I)
+    if m:
+        i, lab = parse_time_label(m.group(1))
+        if i is not None:
+            return ((i, lab), (i, lab))
+
+    m = re.search(r"\b(\d{1,2}:\d{2})\b", s_norm)
+    if m:
+        i, lab = parse_time_label(m.group(1))
+        if i is not None:
+            return ((i, lab), (i, lab))
+
+    m = re.search(r"\b(\d{3,4})\b", s_norm)
+    if m:
+        i, lab = parse_time_label(m.group(1))
+        if i is not None:
+            return ((i, lab), (i, lab))
+
+    # 5) TBA/TBD
+    if "tba" in s_norm or "tbd" in s_norm:
+        return ((None, "TBA"), (None, "TBA"))
+
+    return ((None, "TBA"), (None, "TBA"))
 
 def _credits_to_range(pts: str) -> Tuple[Optional[float], Optional[float]]:
     s = (pts or "").strip()
@@ -361,12 +390,19 @@ def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) 
             continue
 
         # Normalize values
-        start_time, end_time = _parse_time_range(time_rng)
-        if start_time is None and end_time is None:
-            # Fallback: if the Time slice was blank or misaligned, try the entire line
-            st2, et2 = _parse_time_range(ln)
-            if st2 and et2:
-                start_time, end_time = st2, et2
+        # --- Time parsing (full line first, but accept only a valid range) ---
+        (s1_i, s1_lab), (e1_i, e1_lab) = parse_timerange_any(ln)
+        use_full_line = (s1_i is not None and e1_i is not None and e1_i > s1_i)
+
+        if not use_full_line:
+            (s2_i, s2_lab), (e2_i, e2_lab) = parse_timerange_any(time_rng)
+            # accept any slice result (range or single), because it's column-scoped
+            s_i, s_lab, e_i, e_lab = s2_i, s2_lab, e2_i, e2_lab
+        else:
+            s_i, s_lab, e_i, e_lab = s1_i, s1_lab, e1_i, e1_lab
+
+        start_time = None if s_lab == "TBA" else s_lab
+        end_time   = None if e_lab == "TBA" else e_lab
 
         credits_min, credits_max = _credits_to_range(pts)
 
@@ -552,7 +588,7 @@ def main():
     parser.add_argument("--subjects", nargs="*", default=None, help="Explicit subject codes to scrape (overrides subjects-file).")
     parser.add_argument("--scrape", action="store_true", help="After discovery, scrape subjects.")
     parser.add_argument("--max-subjects", type=int, default=None, help="Optional cap when scraping many subjects.")
-    parser.add_argument("--out", default="data/sample_output.json", help="Where to write scraped JSON.")
+    parser.add_argument("-o", "--out", default="data/sample_output.json", help="Where to write scraped JSON.")
     args = parser.parse_args()
 
     session = requests.Session()
