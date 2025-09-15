@@ -1,4 +1,3 @@
-# src/scraper.py
 from __future__ import annotations
 
 import argparse
@@ -8,12 +7,9 @@ import re
 import string
 import sys
 import time
-import unicodedata
-from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
-
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,8 +43,6 @@ DAY_MAP = {
     "U": "Sun",
 }
 
-_TIME_SEP_RE = re.compile(r"\s*(?:-|–|—|‒|to)\s*", re.I)
-
 # ---------------------------------
 # Term normalization and conversions
 # ---------------------------------
@@ -68,7 +62,6 @@ def term_to_sis_code(term_str: str) -> str:
     return f"{year}{TERM_SEMESTER_CODE[semester]}"
 
 def term_human(term_str: str) -> str:
-    # "Fall2025" -> "Fall 2025"
     t = normalize_term(term_str)
     return f"{t[:-4]} {t[-4:]}"
 
@@ -107,12 +100,10 @@ def discover_subjects_for_term(term: str, session: requests.Session, throttle: f
     subjects: Dict[str, str] = {}
 
     for letter in string.ascii_uppercase:
-        url = f"{BASE}/sel/subj-{letter}.html"  # e.g., https://doc.sis.columbia.edu/sel/subj-A.html
+        url = f"{BASE}/sel/subj-{letter}.html"
         html = fetch_text(session, url, throttle)
         soup = BeautifulSoup(html, "html.parser")
 
-        # On each line: <Subject Name>  [Summer2025] [Fall2025] ...
-        # We need anchors whose text equals term_norm; their hrefs point to /subj/<CODE>/_Fall2025.html
         for a in soup.find_all("a"):
             if (a.get_text(strip=True) or "") == term_norm:
                 href = a.get("href") or ""
@@ -120,9 +111,7 @@ def discover_subjects_for_term(term: str, session: requests.Session, throttle: f
                 if not m:
                     continue
                 code = m.group(1)
-                # Subject name is in parent text ("Applied Mathematics Summer2025, Fall2025")
                 parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
-                # Strip trailing term tokens
                 name = re.split(r"\b(Spring|Summer|Fall)\d{4}", parent_text)[0].strip(" ,:\u00A0")
                 subjects[code] = name if name else code
 
@@ -150,7 +139,7 @@ def load_subject_codes_from_file(path: str) -> List[str]:
 def _detect_columns(header_line: str) -> Dict[str, slice]:
     """
     Build fixed-width slices from the header row in the plain-text page.
-    Header example (from DOC):
+    Header example:
         Number Sec  Call#      Pts  Title                           Day Time          Room Building        Faculty
     """
     def col_pos(name: str) -> int:
@@ -159,7 +148,6 @@ def _detect_columns(header_line: str) -> Dict[str, slice]:
             raise ValueError(f"Column '{name}' not found in header.")
         return idx
 
-    # Get start indices
     starts = {
         "Number": col_pos("Number"),
         "Sec": col_pos("Sec"),
@@ -172,7 +160,6 @@ def _detect_columns(header_line: str) -> Dict[str, slice]:
         "Building": col_pos("Building"),
         "Faculty": col_pos("Faculty"),
     }
-    # Compute slices by next column start
     keys = ["Number", "Sec", "Call#", "Pts", "Title", "Day", "Time", "Room", "Building", "Faculty"]
     slices: Dict[str, slice] = {}
     for i, k in enumerate(keys):
@@ -218,14 +205,12 @@ def parse_time_label(s: str) -> Tuple[Optional[int], str]:
 
     t = _normalize_dashes(s).strip().lower().replace(".", "")
 
-    # AM/PM form
     m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*([ap]m)", t)
     if m:
         hh, mm, ap = int(m.group(1)), int(m.group(2)), m.group(3)
         lab = _to_24h(hh, mm, ap)
         return (int(lab.replace(":", "")), lab)
 
-    # 24h HH:MM
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -233,7 +218,6 @@ def parse_time_label(s: str) -> Tuple[Optional[int], str]:
             lab = f"{hh:02d}:{mm:02d}"
             return (int(lab.replace(":", "")), lab)
 
-    # HHMM digits
     lab = _parse_hhmm_digits(t)
     if lab:
         return (int(lab.replace(":", "")), lab)
@@ -243,20 +227,14 @@ def parse_time_label(s: str) -> Tuple[Optional[int], str]:
 def parse_timerange_any(s: str) -> Tuple[Tuple[Optional[int], str], Tuple[Optional[int], str]]:
     """
     Normalize unicode dashes → '-', accept 'to' as a separator.
-    Try in order:
-      1) AM/PM range (AM/PM may appear on one or both sides; propagate if only one side has it)
-      2) 24h HH:MM range
-      3) HHMM digits range
-      4) Single time (AM/PM or HH:MM or HHMM) → duplicate to both
-      5) TBA/TBD
-    Return ((start_int|None, start_label), (end_int|None, end_label)).
+    Try in order: AM/PM range; HH:MM range; HHMM range; single time (duplicate); TBA.
     """
     s_norm = _normalize_dashes(s).lower().replace(".", "")
 
     if not s_norm or s_norm in {"tba", "tbd"}:
         return ((None, "TBA"), (None, "TBA"))
 
-    # 1) AM/PM range
+    # 1) AM/PM range (allow AM/PM on one side only → propagate)
     m = re.search(
         r"(\d{1,2}):(\d{2})\s*([ap]m)?\s*(?:-|to)\s*(\d{1,2}):(\d{2})\s*([ap]m)?",
         s_norm, re.I
@@ -293,7 +271,7 @@ def parse_timerange_any(s: str) -> Tuple[Tuple[Optional[int], str], Tuple[Option
             if i2 > i1:
                 return ((i1, l1), (i2, l2))
 
-    # 4) Single time (duplicate) — guard against TBA and invalids
+    # 4) Single time (duplicate)
     m = re.search(r"\b(\d{1,2}:\d{2}\s*[ap]m)\b", s_norm, re.I)
     if m:
         i, lab = parse_time_label(m.group(1))
@@ -336,20 +314,93 @@ def _credits_to_range(pts: str) -> Tuple[Optional[float], Optional[float]]:
 
 def _split_days(day_field: str) -> List[str]:
     s = (day_field or "").strip().upper()
-    # Single letters with possible spaces; combine e.g. "TR" or "MW".
     s = re.sub(r"\s+", "", s)
     return [DAY_MAP[d] for d in s if d in DAY_MAP]
 
+def _is_real_course_row(number: str, sec: str, calln: str, title: str) -> bool:
+    """
+    Guard against banners/continuations.
+    A real row must have (number OR section OR numeric Call#) AND a non-empty title.
+    """
+    number = (number or "").strip()
+    sec = (sec or "").strip()
+    calln = (calln or "").strip()
+    title = (title or "").strip()
+    if not title:
+        return False
+    if number or sec:
+        return True
+    if calln.isdigit():
+        return True
+    return False
+
+def _repair_location(room: str, building: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    80% heuristic to fix common off-by-ones and TBA splits.
+    """
+    r = (room or "").strip()
+    b = (building or "").strip()
+
+    if r.lower() == "to be" and "announced" in b.lower():
+        b = "To be announced"
+        r = ""
+
+    if b.lower() == "to be announced":
+        return (None, "To be announced")
+
+    # Off-by-one: trailing single uppercase in room & lowercase start in building
+    if r and re.fullmatch(r".*\b\d+\s*[A-Z]$", r) and b and b[:1].islower():
+        m = re.match(r"^(.*\b\d+)\s*([A-Z])$", r)
+        if m:
+            r_main, trailer = m.group(1).strip(), m.group(2)
+            b = (trailer + b)
+            b = b[0].upper() + b[1:]
+            r = r_main
+
+    # If room is just a lone capital and building starts lowercase → move it
+    if r and re.fullmatch(r"[A-Z]", r) and b and b[:1].islower():
+        b = r + b
+        b = b[0].upper() + b[1:]
+        r = ""
+
+    if b.lower() == "to be announced":
+        r = ""
+
+    r = r or None
+    b = b or None
+    return (r, b)
+
+def _coerce_pm_if_needed(start_label: Optional[str], end_label: Optional[str], line_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Final safety: if a line contains 'pm' but not 'am', bump <12:00 times to PM.
+    """
+    txt = (line_text or "").lower()
+    has_pm = "pm" in txt
+    has_am = "am" in txt
+    if not has_pm or has_am:
+        return (start_label, end_label)
+
+    def bump(lab: Optional[str]) -> Optional[str]:
+        if not lab or lab == "TBA":
+            return lab
+        try:
+            h = int(lab[:2]); mm = lab[3:]
+            if h < 12:
+                return f"{h+12:02d}:{mm}"
+            return lab
+        except Exception:
+            return lab
+
+    return (bump(start_label), bump(end_label))
+
 def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) -> List[Dict]:
     """
-    Given the _Fall2025_text.html content, parse into a list of section dicts.
+    Given the _<TERM>_text.html content, parse into a list of section dicts.
     """
-    # Extract the PRE-ish block (page is text wrapped in <pre> or monospaced <div>)
     soup = BeautifulSoup(text_html, "html.parser")
     raw = soup.get_text("\n", strip=False)
 
     lines = [ln.rstrip("\n") for ln in raw.splitlines()]
-    # Find header line (has "Number Sec  Call#")
     header_idx = -1
     for i, ln in enumerate(lines):
         if "Number" in ln and "Call#" in ln and "Faculty" in ln:
@@ -367,13 +418,11 @@ def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) 
     while i < len(lines):
         ln = lines[i]
         i += 1
-        # Skip empty or "L Code" etc footers
         if not ln.strip():
             continue
         if re.search(r"\bL\s+Code\b", ln):
             break
 
-        # Rows that contain a Number (course number) live in this line
         number = ln[slices["Number"]].strip()
         sec = ln[slices["Sec"]].strip()
         calln = ln[slices["Call#"]].strip()
@@ -381,70 +430,77 @@ def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) 
         title = ln[slices["Title"]].strip()
         day = ln[slices["Day"]].strip()
         time_rng = ln[slices["Time"]].strip()
-        room = ln[slices["Room"]].strip()
-        building = ln[slices["Building"]].strip()
+        room_raw = ln[slices["Room"]].strip()
+        building_raw = ln[slices["Building"]].strip()
         faculty = ln[slices["Faculty"]].strip()
 
-        # Some rows are continuation or notes lines (no Number/Sec), skip those here
-        if not number and not sec and not title and not day and not time_rng and not faculty:
+        # Drop obvious banners/continuations
+        if not _is_real_course_row(number, sec, calln, title):
+            # Instructor continuation merge
+            if faculty and sections:
+                prev = sections[-1]
+                instr = (prev.get("instructor") or "").strip()
+                if instr.endswith(",") or ("," in instr and len(instr.split(",")[1].strip()) <= 1):
+                    prev["instructor"] = f"{instr} {faculty}".strip()
             continue
 
-        # Normalize values
-        # --- Time parsing (full line first, but accept only a valid range) ---
+        # Time parsing: prefer full line (range), else Time slice
         (s1_i, s1_lab), (e1_i, e1_lab) = parse_timerange_any(ln)
         use_full_line = (s1_i is not None and e1_i is not None and e1_i > s1_i)
-
         if not use_full_line:
             (s2_i, s2_lab), (e2_i, e2_lab) = parse_timerange_any(time_rng)
-            # accept any slice result (range or single), because it's column-scoped
-            s_i, s_lab, e_i, e_lab = s2_i, s2_lab, e2_i, e2_lab
+            s_lab, e_lab = s2_lab, e2_lab
         else:
-            s_i, s_lab, e_i, e_lab = s1_i, s1_lab, e1_i, e1_lab
+            s_lab, e_lab = s1_lab, e1_lab
+
+        # Coerce to PM if line shows only PM tokens
+        s_lab, e_lab = _coerce_pm_if_needed(s_lab, e_lab, ln)
 
         start_time = None if s_lab == "TBA" else s_lab
         end_time   = None if e_lab == "TBA" else e_lab
 
         credits_min, credits_max = _credits_to_range(pts)
 
-        # Peek next line for "Activity" (e.g., LECTURE/SEMINAR/LAB) if present
+        # Peek for "Activity"
         component = None
         if i < len(lines):
             nxt = lines[i]
             if re.search(r"\bActivity\b", nxt) or re.search(r"\bLECTURE\b|\bSEMINAR\b|\bLAB\b|\bRECITATION\b", nxt, re.I):
-                # Extract activity token if present
                 m = re.search(r"\b(LECTURE|SEMINAR|LAB|RECITATION|INDEPEND|PRACTICUM|WORKSHOP|STUDIO)\b", nxt, re.I)
                 if m:
                     component = m.group(1).upper()
-                i += 1  # consume this extra line
+                i += 1
 
-        # Build the section record
+        # Location repair
+        room, building = _repair_location(room_raw, building_raw)
+
         sections.append({
             "university": "Columbia University",
-            "term": term_label,                       # e.g., "Fall 2025"
-            "subject": subject_code,                  # e.g., "COMS"
-            "number": number,                         # e.g., "W4701"
-            "course_code": f"{subject_code} {number}",# e.g., "COMS W4701"
-            "section": sec,                           # e.g., "001" or "R01"
-            "crn": calln,                             # call number
+            "term": term_label,
+            "subject": subject_code,
+            "number": number,
+            "course_code": f"{subject_code} {number}",
+            "section": sec,
+            "crn": calln,
             "title": title,
             "credits_min": credits_min,
             "credits_max": credits_max,
-            "credits": credits_min if credits_min == credits_max else None,  # convenient single value if fixed
+            "credits": credits_min if credits_min == credits_max else None,
             "days": _split_days(day),
             "start_time": start_time,
             "end_time": end_time,
             "location": {
-                "building": building or None,
-                "room": room or None,
+                "building": building,
+                "room": room,
                 "campus": None,
             },
             "instructor": faculty or None,
-            "component": component,  # may be None; recitation detection also uses section code & credits
+            "component": component,
             "is_recitation": bool(RECITATION_SEC_RE.match(sec)) or (component == "RECITATION" and (credits_min == 0 or credits_min is None)),
-            "parent_course_code": None,              # to be filled by linker if we can find it
-            "detail_url": None,                      # to be filled later
-            "short_desc": None,                      # optional enrichment
-            "status": None,                          # optional enrichment
+            "parent_course_code": None,
+            "detail_url": None,
+            "short_desc": None,
+            "status": None,
         })
 
     return sections
@@ -454,7 +510,6 @@ def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) 
 # -------------------------
 
 def build_section_detail_url(subject: str, number: str, term_code: str, section: str) -> str:
-    # e.g., /subj/APMA/E2001-20253-R01/
     return f"{BASE}/subj/{subject}/{number}-{term_code}-{section}/"
 
 def try_link_recitation_parent(session: requests.Session, subj: str, number: str, sec: str, term_code: str, throttle: float = 0.35) -> Optional[str]:
@@ -470,20 +525,12 @@ def try_link_recitation_parent(session: requests.Session, subj: str, number: str
     return None
 
 def link_recitations(sections: List[Dict], term_code: str, session: requests.Session) -> List[Dict]:
-    """
-    For sections flagged as recitations (R## or "RECITATION"/0 credits), try to find their parent lecture.
-    Strategy:
-      1) Strong: parse the section detail page (often states 'Required recitation session for ...').
-      2) Fallback: find nearest lecture with matching subject + (normalized) title and credits>0.
-    """
     def norm(s: Optional[str]) -> str:
         return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-    # Index candidate lectures by (subject, title_norm) -> set(course codes)
     lecture_index: Dict[Tuple[str, str], List[str]] = {}
     for s in sections:
         if not s.get("is_recitation"):
-            # Consider "lecture-like" primary comps: credits>0 OR component indicates lecture/seminar
             if (s.get("credits_min") or 0) > 0 or (s.get("component") in ("LECTURE", "SEMINAR", "WORKSHOP", "STUDIO")):
                 key = (s["subject"], norm(s["title"]))
                 lecture_index.setdefault(key, [])
@@ -495,20 +542,16 @@ def link_recitations(sections: List[Dict], term_code: str, session: requests.Ses
         if not s.get("is_recitation"):
             continue
         subj, number, sec = s["subject"], s["number"], s["section"]
-        # Fill detail URL always; helpful for UI
         s["detail_url"] = build_section_detail_url(subj, number, term_code, sec)
 
-        # Strong link via detail page
         parent = try_link_recitation_parent(session, subj, number, sec, term_code)
         if not parent:
-            # Fallback: title match within the same subject
             key = (subj, norm(s["title"]))
             candidates = lecture_index.get(key, [])
             parent = candidates[0] if candidates else None
         if parent:
             s["parent_course_code"] = parent
 
-    # Also attach detail_url for non-recitation sections (handy for "Open in DOC")
     for s in sections:
         if not s.get("detail_url"):
             s["detail_url"] = build_section_detail_url(s["subject"], s["number"], term_code, s["section"])
@@ -520,20 +563,13 @@ def link_recitations(sections: List[Dict], term_code: str, session: requests.Ses
 # ----------------
 
 def scrape_subject(subject_code: str, term: str, session: requests.Session, throttle: float = 0.4) -> List[Dict]:
-    """
-    Scrape one subject for the given term using the plain-text page:
-        https://doc.sis.columbia.edu/subj/<SUBJECT>/_<TERM>.html
-        https://doc.sis.columbia.edu/subj/<SUBJECT>/_<TERM>_text.html
-    """
-    term_norm = normalize_term(term)   # Fall2025
-    term_code = term_to_sis_code(term) # e.g., 20253
-    term_label = term_human(term)      # e.g., "Fall 2025"
+    term_norm = normalize_term(term)
+    term_code = term_to_sis_code(term)
+    term_label = term_human(term)
 
-    # 1) Ensure the term-subject page exists (for status & "plain text version" link)
     subj_url = f"{BASE}/subj/{subject_code}/_{term_norm}.html"
     html = fetch_text(session, subj_url, throttle)
 
-    # 2) Get the "plain text version"
     soup = BeautifulSoup(html, "html.parser")
     text_link = None
     for a in soup.find_all("a"):
@@ -541,18 +577,12 @@ def scrape_subject(subject_code: str, term: str, session: requests.Session, thro
             text_link = (a.get("href") or "").strip()
             break
     if not text_link:
-        # Fallback: known shape (absolute-from-root path)
         text_link = f"/subj/{subject_code}/_{term_norm}_text.html"
 
-    # Use urljoin to resolve any relative (e.g., "../subj/...") hrefs safely
     text_url = urljoin(f"{BASE}/", (text_link or "").strip())
-    # Alternatively: urljoin(subj_url, text_link) also works; using BASE+'/' is fine too.
-
     text_html = fetch_text(session, text_url, throttle)
 
-    # 3) Parse sections
     sections = parse_subject_text_page(text_html, subject_code, term_label)
-    # 4) Link recitations → lectures; attach detail URLs
     sections = link_recitations(sections, term_code, session)
     return sections
 
@@ -563,7 +593,6 @@ def scrape_many(subject_codes: List[str], term: str, session: requests.Session, 
             secs = scrape_subject(code, term, session, throttle)
             all_sections.extend(secs)
         except requests.HTTPError as e:
-            # Non-offered subjects for the term often 404; skip gracefully
             if e.response is not None and e.response.status_code == 404:
                 print(f"[warn] {code}: no listing for {term_human(term)}")
                 continue
@@ -601,7 +630,6 @@ def main():
     elif args.subjects_file:
         subjects_to_scrape = load_subject_codes_from_file(args.subjects_file)
     else:
-        # Auto-discover
         discovered = discover_subjects_for_term(args.term, session)
         if args.save_subjects:
             save_subjects_file(args.save_subjects, args.term, discovered)

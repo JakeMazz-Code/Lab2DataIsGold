@@ -1,4 +1,3 @@
-# src/transformers.py
 from __future__ import annotations
 
 import os
@@ -27,10 +26,10 @@ st.set_page_config(
     layout="wide",
 )
 
-# Subtle CSS polish
+# Subtle CSS polish (slightly larger top padding so the spinner isn't obscured)
 st.markdown("""
 <style>
-.block-container { padding-top: 0.8rem; padding-bottom: 2rem; }
+.block-container { padding-top: 1.15rem; padding-bottom: 2rem; }
 .small-muted { color: #6b7280; font-size: 0.9rem; }
 .badge { display:inline-block; padding: 0.1rem 0.45rem; border-radius: 0.35rem; background:#eef2ff; margin-right:0.25rem; font-size:0.85rem; }
 .rec-badge { background:#fef3c7; }
@@ -64,10 +63,6 @@ def cached_scrape(subjects: List[str], term: str) -> List[Dict]:
 WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 def ensure_display_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Guarantee that DISPLAY_COLS exist (used by UI tables).
-    We DO NOT assume credits_min/max exist; credits filtering now uses safe .get().
-    """
     out = df.copy()
     for c in set(DISPLAY_COLS) - set(out.columns):
         out[c] = None
@@ -110,7 +105,6 @@ def hhmm_to_hour(hhmm: Optional[str]) -> Optional[float]:
         return None
 
 def make_pipeline_dot() -> str:
-    # A tiny DOT graph explaining the flow
     return r"""
 digraph G {
     rankdir=LR;
@@ -138,13 +132,6 @@ def _to_float(x) -> Optional[float]:
         return None
 
 def credit_bounds(row: pd.Series) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Robustly compute [__cmin, __cmax] for a row.
-    - If fixed credits: [c, c]
-    - If variable credits: [credits_min, credits_max] (fallback if only one is present)
-    - If unknown: [None, None]
-    Uses .get() so missing columns never crash.
-    """
     c  = _to_float(row.get("credits"))
     cmin = _to_float(row.get("credits_min"))
     cmax = _to_float(row.get("credits_max"))
@@ -162,7 +149,14 @@ def credit_bounds(row: pd.Series) -> Tuple[Optional[float], Optional[float]]:
     return cmin, cmax
 
 def build_html_deck(term_label: str, metrics: Dict[str, int], sample_html_table: str) -> str:
-    # A self-contained mini deck (no external assets). Great for emailing or presenting.
+    """
+    A self-contained, single-file HTML "deck":
+      • slide 1: title + term
+      • slide 2: pipeline steps (bullets)
+      • slide 3: key KPIs (sections, courses, subjects, primaries, recitations)
+      • slide 4: sample results table
+    No external assets; easy to email or attach to the demo record.
+    """
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -176,7 +170,6 @@ def build_html_deck(term_label: str, metrics: Dict[str, int], sample_html_table:
   .muted {{ color:#6b7280; }}
   .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; margin-top: 1rem; }}
   .card {{ border:1px solid #e5e7eb; border-radius:8px; padding: 12px; background:#fafafa; }}
-  .code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background:#f3f4f6; padding: 2px 4px; border-radius: 4px; }}
   .table-wrap {{ max-height: 50vh; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; }}
   footer {{ position: fixed; bottom: 10px; right: 16px; font-size: 12px; color:#9ca3af; }}
 </style>
@@ -227,25 +220,21 @@ def build_html_deck(term_label: str, metrics: Dict[str, int], sample_html_table:
 st.sidebar.title("🎓 Columbia Course Finder")
 st.sidebar.markdown("**Proof-of-concept:** discover → scrape → filter → visualize → export.")
 
-# Term selection
 term_input = st.sidebar.selectbox("Term", ["Fall 2025", "Summer 2025", "Spring 2026"], index=0)
 term_label = term_human(term_input)
 term_code = term_to_sis_code(term_input)
 
-# Demo mode
 demo_mode = st.sidebar.toggle("🎬 Demo Mode (recording‑friendly)", value=True,
                               help="Uses curated defaults (e.g., COMS/STAT) and caps subjects for a fast, reproducible demo.")
 
-# Discover subjects immediately (fast A–Z scrape)
 with st.spinner("Discovering subjects for the term…"):
-    subjects_list = cached_discover_subjects(term_input)  # [{"code":"COMS","name":"Computer Science"},...]
+    subjects_list = cached_discover_subjects(term_input)
 subject_options = [f"{s['code']} — {s['name']}" for s in subjects_list]
 code_by_option = {f"{s['code']} — {s['name']}": s["code"] for s in subjects_list}
 st.sidebar.success(f"Loaded {len(subjects_list)} subjects for {term_label}")
 
 st.sidebar.markdown("---")
 
-# Selection controls
 if demo_mode:
     st.sidebar.info("Demo suggestion: scrape **COMS** and **STAT** first, then try **ALL**.")
     default_sel = [opt for opt in subject_options if opt.startswith("COMS")] + \
@@ -267,13 +256,11 @@ max_subjects = st.sidebar.number_input("Cap subjects (testing)", min_value=1, st
                                        help="Use to test a smaller scrape when 'ALL' is selected.")
 go = st.sidebar.button("🚀 Scrape now")
 
-# Session state to hold scraped sections
 if "sections_raw" not in st.session_state:
     st.session_state["sections_raw"] = []
 if "sections_df" not in st.session_state:
     st.session_state["sections_df"] = pd.DataFrame()
 
-# Kick off scrape when user clicks
 if go:
     if all_flag:
         subject_codes = [s["code"] for s in subjects_list][:max_subjects]
@@ -287,7 +274,6 @@ if go:
     with st.spinner("Scraping…"):
         raw = cached_scrape(subject_codes, term_input)
 
-    # Normalize & flatten
     sections = normalize_sections(raw)
     rows = flatten_for_display(sections)
     df = pd.DataFrame(rows)
@@ -342,16 +328,13 @@ with tab_search:
         )
         query = st.text_input("Keyword (title/instructor/building)", value="")
 
-        # Apply filters
         df = st.session_state["sections_df"].copy()
 
-        # ---- CREDITS FILTER (robust, interval-based) ----
         bounds = df.apply(lambda r: pd.Series(credit_bounds(r), index=["__cmin", "__cmax"]), axis=1)
         df = pd.concat([df, bounds], axis=1)
 
         def credits_overlap(row) -> bool:
             cmin, cmax = row.get("__cmin"), row.get("__cmax")
-            # If credits unknown, include by default (so we don't drop courses with missing data)
             if pd.isna(cmin) and pd.isna(cmax):
                 return True
             if pd.isna(cmin): cmin = cmax
@@ -360,7 +343,6 @@ with tab_search:
 
         mask = df.apply(credits_overlap, axis=1)
 
-        # ---- DAY/TIME FILTERS ----
         def row_matches_day(row) -> bool:
             if not day_choices:
                 return True
@@ -396,7 +378,6 @@ with tab_search:
             day_time_mask = df.apply(lambda r: row_matches_day(r) and row_matches_time(r), axis=1)
             mask &= (~only_primary) | (only_primary & day_time_mask)
 
-        # ---- TEXT QUERY ----
         if query.strip():
             q = query.strip().lower()
             def matches_q(row) -> bool:
@@ -470,7 +451,6 @@ with tab_visuals:
         st.markdown("<hr>", unsafe_allow_html=True)
         st.subheader("Distributions & schedule")
 
-        # Build an exploded frame by day for charting
         base_df = st.session_state["sections_df"].copy()
         exploded = explode_days(base_df)
         if exploded.empty:
@@ -479,14 +459,12 @@ with tab_visuals:
             exploded["start_hour"] = exploded["start_time"].apply(hhmm_to_hour)
             exploded = exploded[exploded["day"].isin(WEEKDAY_ORDER)]
 
-            # Sections per weekday (primaries only)
             prim = exploded[exploded.get("is_recitation", False) == False]
             if not prim.empty:
                 weekday_counts = prim.groupby("day").size().reindex(WEEKDAY_ORDER, fill_value=0).reset_index(name="count")
                 st.markdown("**Sections by weekday (primaries)**")
                 st.bar_chart(weekday_counts.set_index("day"))
 
-            # Credits distribution (all)
             credits_df = exploded.dropna(subset=["credits"])
             if not credits_df.empty:
                 st.markdown("**Credits distribution**")
@@ -496,7 +474,6 @@ with tab_visuals:
                 ).properties(height=220, width="container")
                 st.altair_chart(hist, use_container_width=True)
 
-            # Start time heatmap (all)
             heat_df = exploded.dropna(subset=["start_hour"])
             if not heat_df.empty:
                 st.markdown("**Schedule heatmap (start hours by weekday)**")
@@ -547,57 +524,13 @@ with tab_export:
                                file_name="all_sections.csv", mime="text/csv")
 
         with colC:
-            # Build a simple self-contained HTML deck
             df = st.session_state["sections_df"]
             metrics = compute_metrics(df)
             sample_cols = [c for c in ["course_code", "title", "credits", "days", "start_time", "end_time", "instructor", "location"] if c in df.columns]
             sample = df[sample_cols].head(18)
             sample_html = sample.to_html(index=False, escape=False)
 
-            deck_html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<title>Columbia Course Finder — Demo Deck</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#111827; }}
-  .slide {{ width: 100%; height: 100vh; padding: 4rem 6vw; box-sizing: border-box; display:flex; flex-direction:column; justify-content:center; }}
-  h1,h2,h3 {{ margin: 0 0 0.75rem; }}
-  .muted {{ color:#6b7280; }}
-  .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; margin-top: 1rem; }}
-  .card {{ border:1px solid #e5e7eb; border-radius:8px; padding: 12px; background:#fafafa; }}
-  .table-wrap {{ max-height: 50vh; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; }}
-  footer {{ position: fixed; bottom: 10px; right: 16px; font-size: 12px; color:#9ca3af; }}
-</style>
-</head>
-<body>
-
-<section class="slide">
-  <h1>Columbia Course Finder</h1>
-  <h3 class="muted">Term: {term_label}</h3>
-  <p>A scraping demo that discovers subjects, scrapes the Directory of Classes, links recitations to their parent lectures, and presents a student-friendly search UI.</p>
-</section>
-
-<section class="slide">
-  <h2>Key metrics</h2>
-  <div class="kpis">
-    <div class="card"><strong>Sections</strong><div>{metrics["sections"]}</div></div>
-    <div class="card"><strong>Courses</strong><div>{metrics["courses"]}</div></div>
-    <div class="card"><strong>Subjects</strong><div>{metrics["subjects"]}</div></div>
-    <div class="card"><strong>Primaries</strong><div>{metrics["primaries"]}</div></div>
-    <div class="card"><strong>Recitations</strong><div>{metrics["recitations"]}</div></div>
-  </div>
-</section>
-
-<section class="slide">
-  <h2>Sample results</h2>
-  <div class="table-wrap">{sample_html}</div>
-</section>
-
-<footer>Generated {datetime.utcnow().isoformat(timespec="seconds")}Z</footer>
-</body>
-</html>"""
+            deck_html = build_html_deck(term_label, metrics, sample_html)
 
             os.makedirs("docs", exist_ok=True)
             out_path = "docs/demo_deck.html"
