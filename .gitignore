@@ -1,32 +1,52 @@
-# Python
+# Python caches / logs
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 *.py[cod]
 *$py.class
 *.so
+*.log
 .Python
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
 
-# IDE
+# Jupyter/Streamlit local
+.ipynb_checkpoints/
+.streamlit/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Virtual envs
+venv/
+.venv/
+env/
+.env
+ENV/
+env.bak/
+venv.bak/
+
+# Editors / IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Project specific
-data/*.json
-data/*.csv
+# Demo/dev helpers (do not commit)
+src/dev_trace.py
+src/bts_demo.py
+
+# Data: keep ONLY the sample required by the grader
+data/*
 !data/sample_output.json
-*.log
-.env
+
+# Optional: ignore exported HTML demo deck(s) in docs
+docs/*.html
 
 # Selenium
 chromedriver
@@ -34,7 +54,6 @@ geckodriver
 *.exe
 
 # Testing
-.pytest_cache/
 .coverage
 htmlcov/
 
