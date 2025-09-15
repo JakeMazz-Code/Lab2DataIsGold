@@ -179,25 +179,115 @@ def _detect_columns(header_line: str) -> Dict[str, slice]:
     return slices
 
 def _parse_time_range(time_str: str) -> Tuple[Optional[str], Optional[str]]:
-    # "8:40am-9:55am" -> ("08:40", "09:55")
-    s = time_str.strip()
-    if not s or s.lower() == "tba":
+    """
+    Robust parser for Columbia DOC time strings.
+    Accepts:
+      - "1:10 pm-2:25 pm", "1:10pm - 2:25pm", "1:10 PM — 2:25 PM", "1:10 pm to 2:25 pm"
+      - Numeric: "1410-1525", "900-1025"
+      - Single time: "1:10 pm", "1410"  -> duplicate to both
+      - "TBA" -> (None, None)
+
+    Returns 24h labels ("HH:MM") or (None, None).
+    """
+    s_orig = (time_str or "").strip()
+    if not s_orig:
         return (None, None)
-    m = re.match(r"(\d{1,2}:\d{2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)", s, flags=re.I)
-    if not m:
+
+    s = s_orig
+    # Normalize unicode dashes, A.M./P.M., whitespace, "to"
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", s)  # all dash-like → "-"
+    s = re.sub(r"\bto\b", "-", s, flags=re.I)
+    s = re.sub(r"\.", "", s)  # a.m. -> am
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if re.search(r"\bTBA\b", s, flags=re.I):
         return (None, None)
-    def to_24h(x: str) -> str:
-        x = x.strip().lower()
-        am = x.endswith("am")
-        pm = x.endswith("pm")
-        x = x[:-2].strip()
-        hh, mm = [int(t) for t in x.split(":")]
-        if pm and hh != 12:
-            hh += 12
-        if am and hh == 12:
-            hh = 0
-        return f"{hh:02d}:{mm:02d}"
-    return (to_24h(m.group(1)), to_24h(m.group(2)))
+
+    def ampm_parts(tok: str) -> Tuple[int, int, Optional[str]]:
+        m = re.search(r"^\s*(\d{1,2}):(\d{2})\s*([ap]m)?\s*$", tok, flags=re.I)
+        if not m:
+            return (-1, -1, None)
+        hh, mm = int(m.group(1)), int(m.group(2))
+        ap = (m.group(3) or "").lower() if m.group(3) else None
+        return hh, mm, ap
+
+    def to_24h(h: int, m: int, ap: Optional[str]) -> Optional[str]:
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            return None
+        if ap:
+            if ap == "pm" and h != 12:
+                h += 12
+            if ap == "am" and h == 12:
+                h = 0
+        return f"{h:02d}:{m:02d}"
+
+    def hhmm_token(tok: str) -> Optional[str]:
+        tok = tok.strip()
+        m = re.match(r"^(\d{3,4})$", tok)
+        if not m:
+            return None
+        val = m.group(1)
+        if len(val) == 3:
+            h = int(val[0])
+            mm = int(val[1:])
+        else:
+            h = int(val[:2])
+            mm = int(val[2:])
+        if 0 <= h <= 23 and 0 <= mm <= 59:
+            return f"{h:02d}:{mm:02d}"
+        return None
+
+    # 1) AM/PM range (allow missing am/pm on one side; infer from the other)
+    m = re.search(r"(\d{1,2}:\d{2}\s*(?:[ap]m)?)\s*-\s*(\d{1,2}:\d{2}\s*(?:[ap]m)?)", s, flags=re.I)
+    if m:
+        a_raw, b_raw = m.group(1), m.group(2)
+        ah, am, aap = ampm_parts(a_raw)
+        bh, bm, bap = ampm_parts(b_raw)
+        if not aap and bap:
+            aap = bap
+        if not bap and aap:
+            bap = aap
+        a24 = to_24h(ah, am, aap)
+        b24 = to_24h(bh, bm, bap)
+        if a24 and b24:
+            # If inferred same meridiem yields end <= start, flip end once
+            ah24, am24 = map(int, a24.split(":"))
+            bh24, bm24 = map(int, b24.split(":"))
+            if (bh24 * 60 + bm24) <= (ah24 * 60 + am24) and (bap is None) and (aap in {"am", "pm"}):
+                flip = "pm" if aap == "am" else "am"
+                b24_alt = to_24h(bh, bm, flip)
+                if b24_alt:
+                    b24 = b24_alt
+            return (a24, b24)
+
+    # 2) HHMM numeric range
+    m = re.search(r"\b(\d{3,4})\s*-\s*(\d{3,4})\b", s)
+    if m:
+        a = hhmm_token(m.group(1))
+        b = hhmm_token(m.group(2))
+        if a and b:
+            ah, am = map(int, a.split(":"))
+            bh, bm = map(int, b.split(":"))
+            if (bh * 60 + bm) > (ah * 60 + am):
+                return (a, b)
+
+    # 3) Single AM/PM → duplicate
+    m = re.search(r"\b(\d{1,2}:\d{2}\s*(?:[ap]m))\b", s, flags=re.I)
+    if m:
+        h, m_, ap = ampm_parts(m.group(1))
+        t = to_24h(h, m_, ap)
+        if t:
+            return (t, t)
+
+    # 4) Single HHMM → duplicate
+    m = re.search(r"\b(\d{3,4})\b", s)
+    if m:
+        t = hhmm_token(m.group(1))
+        if t:
+            return (t, t)
+
+    return (None, None)
 
 def _credits_to_range(pts: str) -> Tuple[Optional[float], Optional[float]]:
     s = (pts or "").strip()
@@ -272,6 +362,12 @@ def parse_subject_text_page(text_html: str, subject_code: str, term_label: str) 
 
         # Normalize values
         start_time, end_time = _parse_time_range(time_rng)
+        if start_time is None and end_time is None:
+            # Fallback: if the Time slice was blank or misaligned, try the entire line
+            st2, et2 = _parse_time_range(ln)
+            if st2 and et2:
+                start_time, end_time = st2, et2
+
         credits_min, credits_max = _credits_to_range(pts)
 
         # Peek next line for "Activity" (e.g., LECTURE/SEMINAR/LAB) if present
@@ -479,7 +575,7 @@ def main():
     if args.max_subjects:
         subjects_to_scrape = subjects_to_scrape[: args.max_subjects]
 
-    if args.discover-subjects and not args.scrape:
+    if args.discover_subjects and not args.scrape:
         return 0
 
     if args.scrape:
