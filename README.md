@@ -20,8 +20,61 @@ project-name/
 └── .gitignore
 ```
 
-## Getting Started
+# Columbia Course Finder (Demo)
 
-1. Install dependencies: `pip install -r requirements.txt`
-2. Review the documentation in the `docs/` folder
-3. Run the scraper: `python src/scraper.py`
+> **Submission Info**  
+> **Graded branch**: `main`  
+> **Submission tag**: `submission-v1`  
+
+> This tree matches the grader-required structure. Demo-only helpers and extra data are not included.
+
+A student-friendly search over Columbia’s Directory of Classes (DOC):
+
+- **Discover** official subjects for a term (A–Z index, no guessing)  
+- **Scrape** the subject’s **plain-text** listing (stable columns)  
+- **Parse & normalize** days/times/locations/instructors  
+- **Link** recitations to parent lectures when disclosed  
+- **Filter & visualize** in Streamlit; **export** CSV and an offline **HTML deck**
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+
+# Streamlit UI
+streamlit run src/transformers.py
+Demo flow: Term “Fall 2025” → select COMS, STAT, APMA → Scrape now → Search filters (e.g., Tue/Thu) → Visuals → Export deck.
+
+CLI
+bash
+Copy code
+python -m src.scraper --scrape --term "Fall 2025" --subjects COMS STAT APMA -o data/sample_output.json
+Architecture (1-slide)
+mermaid
+Copy code
+flowchart LR
+  UI[Streamlit] -->|discover_subjects_for_term| S[scraper.py]
+  S --> AZ[(A–Z term index)]
+  UI -->|scrape_many| S
+  S --> SUBJ[(subject term page)]
+  S --> TEXT[(plain-text listing)]
+  S --> PARSE[parser]
+  PARSE --> LINK[link recitations]
+  LINK --> DETAIL[(section detail)]
+  LINK --> UI
+  UI --> OUT[(table, charts, HTML deck, CSV/JSON)]
+Files
+src/scraper.py — discovery, fetching, parsing, recitation linking
+
+src/validators.py — dataclass normalization + flatten for UI
+
+src/transformers.py — Streamlit UI, charts, export
+
+data/sample_output.json — example output
+
+docs/ — ARCHITECTURE, AI_USAGE, ETHICS, BUSINESS_CASE
+
+Notes
+Scrapes only public DOC pages; throttled and retried politely.
+
+Recommended demo subjects: COMS, STAT, APMA.
