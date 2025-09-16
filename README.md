@@ -84,5 +84,5 @@ streamlit run src/transformers.py
 
 ### Scrape and output to file (for data analysis through JSON file)
 ```bash
-python -m src/scraper --scrape --term "Fall 2025" --subjects COMS STAT APMA -o data/sample_output.json
+python -m src.scraper --scrape --term "Fall 2025" --subjects COMS STAT APMA -o data/sample_output.json
 ```
