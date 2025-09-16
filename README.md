@@ -22,11 +22,14 @@ project-name/
 
 # Columbia Course Finder (Demo)
 
-> **Submission Info**  
-> **Graded branch**: `main`  
-> **Submission tag**: `submission-v1`  
+> **🎯 SUBMISSION INFO - PLEASE GRADE THIS BRANCH 🎯**  
+> **Graded branch**: `submission-files` ⭐ **THIS IS THE BRANCH TO GRADE** ⭐  
+> **Submission date**: September 16, 2025  
+> **Final submission commit**: Latest commit on `submission-files` branch  
 
-> This tree matches the grader-required structure. Demo-only helpers and extra data are not included.
+> ⚠️ **IMPORTANT FOR GRADERS**: This `submission-files` branch contains the final, complete submission. Please use this branch for grading, not `main` or any other branch.
+
+> This repository structure matches all assignment requirements. All documentation, source code, and deliverables are included and ready for evaluation.
 
 A student-friendly search over Columbia’s Directory of Classes (DOC):
 
