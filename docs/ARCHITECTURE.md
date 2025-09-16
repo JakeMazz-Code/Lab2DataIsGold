@@ -34,7 +34,7 @@
 
 ## High-Level Flow
 
-'''mermaid
+```mermaid
 flowchart LR
   U["User"] -->|"Term + Subjects"| UI["Streamlit (transformers.py)"]
   UI -->|"discover_subjects_for_term"| S["scraper.py"]
@@ -50,7 +50,8 @@ flowchart LR
   VAL -->|"flatten_for_display"| UI
   UI -->|"Search/Charts/Export"| OUT["Table, Charts, HTML deck, CSV/JSON"]
 
-'''
+```
+
 # Key Components
 
 ## `src/scraper.py`
