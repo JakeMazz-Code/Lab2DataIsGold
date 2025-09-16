@@ -34,7 +34,6 @@
 
 ## High-Level Flow
 
-```mermaid
 flowchart LR
   U[User] -->|Term + Subjects| UI[Streamlit (transformers.py)]
   UI -->|discover_subjects_for_term| S[scraper.py]
@@ -49,6 +48,7 @@ flowchart LR
   UI -->|normalize_sections| VAL[validators.py]
   VAL -->|flatten_for_display| UI
   UI -->|Search/Charts/Export| OUT[(Table, Charts, HTML deck, CSV/JSON)]
+
 
 
 # Key Components
