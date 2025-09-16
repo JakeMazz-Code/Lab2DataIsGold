@@ -35,21 +35,19 @@
 ## High-Level Flow
 
 flowchart LR
-  U[User] -->|Term + Subjects| UI[Streamlit (transformers.py)]
-  UI -->|discover_subjects_for_term| S[scraper.py]
-  S -->|GET sel/subj-A..Z| AZ[(DOC A–Z term pages)]
-  UI -->|scrape_many| S
-  S -->|GET subj/{SUBJ}/_{TERM}.html| SUBJ[(DOC subject term page)]
-  S -->|follow 'plain text version'| TEXT[(DOC plain text listing)]
-  S -->|parse_subject_text_page| PARSE[Row parser]
-  PARSE -->|section dicts| LINK[link_recitations]
-  LINK -->|maybe GET detail| DETAIL[(DOC section detail)]
-  LINK -->|linked sections| UI
-  UI -->|normalize_sections| VAL[validators.py]
-  VAL -->|flatten_for_display| UI
-  UI -->|Search/Charts/Export| OUT[(Table, Charts, HTML deck, CSV/JSON)]
-
-
+  U["User"] -->|"Term + Subjects"| UI["Streamlit (transformers.py)"]
+  UI -->|"discover_subjects_for_term"| S["scraper.py"]
+  S -->|"GET sel/subj-A..Z"| AZ["DOC A-Z term pages"]
+  UI -->|"scrape_many"| S
+  S -->|"GET subj/{SUBJ}/_{TERM}.html"| SUBJ["DOC subject term page"]
+  S -->|"follow plain text version"| TEXT["DOC plain text listing"]
+  S -->|"parse_subject_text_page"| PARSE["Row parser"]
+  PARSE -->|"section dicts"| LINK["link_recitations"]
+  LINK -->|"maybe GET detail"| DETAIL["DOC section detail"]
+  LINK -->|"linked sections"| UI
+  UI -->|"normalize_sections"| VAL["validators.py"]
+  VAL -->|"flatten_for_display"| UI
+  UI -->|"Search/Charts/Export"| OUT["Table, Charts, HTML deck, CSV/JSON"]
 
 # Key Components
 
@@ -97,10 +95,6 @@ flowchart LR
 - Flag recitations (`R##` / 0-credit)
 - Fetch detail page and match `Required recitation … enrolled in ({SUBJ}) ({NUMBER})`
 - Else fallback to title match
-
-### CLI usage
-```bash
-python -m src.scraper --scrape --term "Fall 2025" --subjects COMS STAT APMA -o data/sample_output.json
 
 
 
